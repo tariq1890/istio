@@ -181,7 +181,7 @@ data:
         "neverInjectSelector": [],
         "objectSelector": {
           "autoInject": true,
-          "enabled": false
+          "enabled": true
         },
         "rewriteAppHTTPProbe": true
       }
@@ -1665,3 +1665,9 @@ webhooks:
     namespaceSelector:
       matchLabels:
         istio-injection: enabled
+    objectSelector:
+      matchExpressions:
+      - key: "sidecar.istio.io/inject"
+        operator: NotIn
+        values:
+        - "false"
