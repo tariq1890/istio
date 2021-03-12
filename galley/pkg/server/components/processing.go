@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,315 +15,137 @@
 package components
 
 import (
-	"fmt"
-	"net"
-	"strings"
-	"sync"
-	"time"
-
-	"golang.org/x/time/rate"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/keepalive"
-	grpcMetadata "google.golang.org/grpc/metadata"
-
-	"istio.io/pkg/ctrlz/fw"
-	"istio.io/pkg/log"
-	"istio.io/pkg/version"
-
-	mcp "istio.io/api/mcp/v1alpha1"
-
-	"istio.io/istio/galley/pkg/meshconfig"
-	"istio.io/istio/galley/pkg/metadata"
-	kubeMeta "istio.io/istio/galley/pkg/metadata/kube"
-	"istio.io/istio/galley/pkg/runtime"
-	"istio.io/istio/galley/pkg/runtime/groups"
-	"istio.io/istio/galley/pkg/runtime/resource"
-	"istio.io/istio/galley/pkg/server/process"
+	"istio.io/istio/galley/pkg/config/analysis/analyzers"
+	"istio.io/istio/galley/pkg/config/processing"
+	"istio.io/istio/galley/pkg/config/processing/snapshotter"
+	"istio.io/istio/galley/pkg/config/processor"
+	"istio.io/istio/galley/pkg/config/processor/groups"
+	"istio.io/istio/galley/pkg/config/processor/transforms"
+	"istio.io/istio/galley/pkg/config/source/kube"
+	"istio.io/istio/galley/pkg/config/source/kube/apiserver"
+	"istio.io/istio/galley/pkg/config/source/kube/apiserver/status"
+	"istio.io/istio/galley/pkg/config/util/kuberesource"
 	"istio.io/istio/galley/pkg/server/settings"
-	"istio.io/istio/galley/pkg/source/kube/builtin"
-	"istio.io/istio/galley/pkg/source/kube/client"
-	"istio.io/istio/galley/pkg/source/kube/dynamic/converter"
-	"istio.io/istio/galley/pkg/source/kube/schema"
-	configz "istio.io/istio/pkg/mcp/configz/server"
-	"istio.io/istio/pkg/mcp/creds"
-	"istio.io/istio/pkg/mcp/monitoring"
-	mcprate "istio.io/istio/pkg/mcp/rate"
-	"istio.io/istio/pkg/mcp/server"
+	"istio.io/istio/pkg/config/event"
+	"istio.io/istio/pkg/config/schema"
+	"istio.io/istio/pkg/config/schema/collection"
 	"istio.io/istio/pkg/mcp/snapshot"
-	"istio.io/istio/pkg/mcp/source"
 )
 
-const versionMetadataKey = "config.source.version"
-
-// Processing component.
+// Processing component is the main config processing component that will listen to a config source and publish
+// resources through an MCP server, or a dialout connection.
 type Processing struct {
 	args *settings.Args
 
-	distributor  *snapshot.Cache
-	configzTopic fw.Topic
+	mcpCache *snapshot.Cache
 
-	serveWG       sync.WaitGroup
-	grpcServer    *grpc.Server
-	processor     *runtime.Processor
-	mcpSource     *source.Server
-	reporter      monitoring.Reporter
-	callOut       *callout
-	listenerMutex sync.Mutex
-	listener      net.Listener
-	stopCh        chan struct{}
+	k kube.Interfaces
+
+	runtime *processing.Runtime
+	stopCh  chan struct{}
 }
-
-var _ process.Component = &Processing{}
 
 // NewProcessing returns a new processing component.
 func NewProcessing(a *settings.Args) *Processing {
-	d := snapshot.New(groups.IndexFunction)
+	mcpCache := snapshot.New(groups.IndexFunction)
 	return &Processing{
-		args:         a,
-		distributor:  d,
-		configzTopic: configz.CreateTopic(d),
+		args:     a,
+		mcpCache: mcpCache,
 	}
 }
 
 // Start implements process.Component
 func (p *Processing) Start() (err error) {
-	// TODO: cleanup
+	var mesh event.Source
+	var src event.Source
+	var updater snapshotter.StatusUpdater
 
-	var mesh meshconfig.Cache
-	var src runtime.Source
-
-	if mesh, err = newMeshConfigCache(p.args.MeshConfigFile); err != nil {
+	if mesh, err = meshcfgNewFS(p.args.MeshConfigFile); err != nil {
 		return
 	}
 
-	if src, err = p.createSource(mesh); err != nil {
+	m := schema.MustGet()
+
+	transformProviders := transforms.Providers(m)
+
+	// Disable any unnecessary resources, including resources not in configured snapshots
+	var colsInSnapshots collection.Names
+	for _, c := range m.AllCollectionsInSnapshots(p.args.Snapshots) {
+		colsInSnapshots = append(colsInSnapshots, collection.NewName(c))
+	}
+	kubeResources := kuberesource.DisableExcludedCollections(m.KubeCollections(), transformProviders,
+		colsInSnapshots, p.args.ExcludedResourceKinds, p.args.EnableServiceDiscovery)
+
+	if src, updater, err = p.createSourceAndStatusUpdater(kubeResources); err != nil {
 		return
 	}
 
-	types := p.getMCPTypes()
+	var distributor snapshotter.Distributor = snapshotter.NewMCPDistributor(p.mcpCache)
 
-	processorCfg := runtime.Config{
-		DomainSuffix:             p.args.DomainSuffix,
-		Mesh:                     mesh,
-		Schema:                   types,
-		SynthesizeServiceEntries: p.args.EnableServiceDiscovery,
+	if p.args.EnableConfigAnalysis {
+		combinedAnalyzer := analyzers.AllCombined()
+		combinedAnalyzer.RemoveSkipped(colsInSnapshots, kubeResources.DisabledCollectionNames(), transformProviders)
+
+		distributor = snapshotter.NewAnalyzingDistributor(snapshotter.AnalyzingDistributorSettings{
+			StatusUpdater:     updater,
+			Analyzer:          combinedAnalyzer,
+			Distributor:       distributor,
+			AnalysisSnapshots: p.args.Snapshots,
+			TriggerSnapshot:   p.args.TriggerSnapshot,
+		})
 	}
-	p.processor = runtime.NewProcessor(src, p.distributor, &processorCfg)
 
-	grpcOptions := p.getServerGrpcOptions()
+	processorSettings := processor.Settings{
+		Metadata:           m,
+		DomainSuffix:       p.args.DomainSuffix,
+		Source:             event.CombineSources(mesh, src),
+		TransformProviders: transformProviders,
+		Distributor:        distributor,
+		EnabledSnapshots:   p.args.Snapshots,
+	}
+	if p.runtime, err = processorInitialize(processorSettings); err != nil {
+		return
+	}
 
 	p.stopCh = make(chan struct{})
-	var checker source.AuthChecker = server.NewAllowAllChecker()
-	if !p.args.Insecure {
-		if checker, err = watchAccessList(p.stopCh, p.args.AccessListFile); err != nil {
-			return
-		}
 
-		var watcher creds.CertificateWatcher
-		if watcher, err = creds.PollFiles(p.stopCh, p.args.CredentialOptions); err != nil {
-			return
-		}
-		credentials := creds.CreateForServer(watcher)
-
-		grpcOptions = append(grpcOptions, grpc.Creds(credentials))
-	}
-	grpc.EnableTracing = p.args.EnableGRPCTracing
-	p.grpcServer = grpc.NewServer(grpcOptions...)
-
-	p.reporter = mcpMetricReporter("galley/mcp/source")
-
-	options := &source.Options{
-		Watcher:            p.distributor,
-		Reporter:           p.reporter,
-		CollectionsOptions: source.CollectionOptionsFromSlice(types.Collections()),
-		ConnRateLimiter:    mcprate.NewRateLimiter(time.Second, 100), // TODO(Nino-K): https://github.com/istio/istio/issues/12074
-	}
-
-	md := grpcMetadata.MD{
-		versionMetadataKey: []string{version.Info.Version},
-	}
-	if err := parseSinkMeta(p.args.SinkMeta, md); err != nil {
-		return err
-	}
-
-	if p.args.SinkAddress != "" {
-		p.callOut, err = newCallout(p.args.SinkAddress, p.args.SinkAuthMode, md, options)
-		if err != nil {
-			p.callOut = nil
-			scope.Errorf("Callout could not be initialized: %v", err)
-			return
-		}
-	}
-
-	serverOptions := &source.ServerOptions{
-		AuthChecker: checker,
-		RateLimiter: rate.NewLimiter(rate.Every(time.Second), 100), // TODO(Nino-K): https://github.com/istio/istio/issues/12074
-		Metadata:    md,
-	}
-
-	p.mcpSource = source.NewServer(options, serverOptions)
-
-	// get the network stuff setup
-	network := "tcp"
-	var address string
-	idx := strings.Index(p.args.APIAddress, "://")
-	if idx < 0 {
-		address = p.args.APIAddress
-	} else {
-		network = p.args.APIAddress[:idx]
-		address = p.args.APIAddress[idx+3:]
-	}
-
-	if p.listener, err = netListen(network, address); err != nil {
-		err = fmt.Errorf("unable to listen: %v", err)
-		return
-	}
-
-	mcp.RegisterResourceSourceServer(p.grpcServer, p.mcpSource)
-
-	var startWG sync.WaitGroup
-	startWG.Add(1)
-
-	p.serveWG.Add(1)
-	go func() {
-		defer p.serveWG.Done()
-		err := p.processor.Start()
-		if err != nil {
-			scope.Errorf("Galley Server unexpectedly terminated: %v", err)
-			return
-		}
-
-		l := p.getListener()
-		if l != nil {
-			// start serving
-			gs := p.grpcServer
-			startWG.Done()
-			err = gs.Serve(l)
-			if err != nil {
-				scope.Errorf("Galley Server unexpectedly terminated: %v", err)
-			}
-		}
-	}()
-
-	if p.callOut != nil {
-		p.serveWG.Add(1)
-		go func() {
-			defer p.serveWG.Done()
-			p.callOut.run()
-		}()
-	}
-
-	startWG.Wait()
+	p.runtime.Start()
 
 	return nil
 }
 
-// ConfigZTopic returns the ConfigZTopic for the processor.
-func (p *Processing) ConfigZTopic() fw.Topic {
-	return p.configzTopic
-}
-
-func (p *Processing) getServerGrpcOptions() []grpc.ServerOption {
-	var grpcOptions []grpc.ServerOption
-	grpcOptions = append(grpcOptions,
-		grpc.MaxConcurrentStreams(uint32(p.args.MaxConcurrentStreams)),
-		grpc.MaxRecvMsgSize(int(p.args.MaxReceivedMessageSize)),
-		grpc.InitialWindowSize(int32(p.args.InitialWindowSize)),
-		grpc.InitialConnWindowSize(int32(p.args.InitialConnectionWindowSize)),
-		grpc.KeepaliveParams(keepalive.ServerParameters{
-			Timeout:               p.args.KeepAlive.Timeout,
-			Time:                  p.args.KeepAlive.Time,
-			MaxConnectionAge:      p.args.KeepAlive.MaxServerConnectionAge,
-			MaxConnectionAgeGrace: p.args.KeepAlive.MaxServerConnectionAgeGrace,
-		}),
-		// Relax keepalive enforcement policy requirements to avoid dropping connections due to too many pings.
-		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
-			MinTime:             30 * time.Second,
-			PermitWithoutStream: true,
-		}),
-	)
-
-	return grpcOptions
-}
-
-func (p *Processing) createSource(mesh meshconfig.Cache) (src runtime.Source, err error) {
-	converterCfg := &converter.Config{
-		Mesh:         mesh,
-		DomainSuffix: p.args.DomainSuffix,
+func (p *Processing) getKubeInterfaces() (k kube.Interfaces, err error) {
+	if p.k == nil {
+		p.k, err = newInterfaces(p.args.KubeConfig)
 	}
-
-	sourceSchema := p.getSourceSchema()
-
-	if p.args.ConfigPath != "" {
-		if src, err = fsNew(p.args.ConfigPath, sourceSchema, converterCfg); err != nil {
-			return
-		}
-	} else {
-		var k client.Interfaces
-		if k, err = newKubeFromConfigFile(p.args.KubeConfig); err != nil {
-			return
-		}
-		var found []schema.ResourceSpec
-
-		if !p.args.DisableResourceReadyCheck {
-			found, err = verifyResourceTypesPresence(k, sourceSchema.All())
-		} else {
-			found, err = findSupportedResources(k, sourceSchema.All())
-		}
-		if err != nil {
-			return
-		}
-		sourceSchema = schema.New(found...)
-		if src, err = newSource(k, p.args.ResyncPeriod, sourceSchema, converterCfg); err != nil {
-			return
-		}
-	}
+	k = p.k
 	return
 }
 
-func (p *Processing) getSourceSchema() *schema.Instance {
-	b := schema.NewBuilder()
-	for _, spec := range kubeMeta.Types.All() {
-
-		if p.args.EnableServiceDiscovery {
-			// TODO: IsBuiltIn is a proxy for types needed for service discovery
-			if builtin.IsBuiltIn(spec.Kind) {
-				b.Add(spec)
-				continue
-			}
-		}
-
-		if !p.isKindExcluded(spec.Kind) {
-			b.Add(spec)
-		}
-	}
-	return b.Build()
-}
-
-func (p *Processing) isKindExcluded(kind string) bool {
-	for _, excludedKind := range p.args.ExcludedResourceKinds {
-		if kind == excludedKind {
-			return true
-		}
-	}
-	return false
-}
-
-func (p *Processing) getMCPTypes() *resource.Schema {
-	b := resource.NewSchemaBuilder()
-	b.RegisterSchema(metadata.Types)
-	b.Register(
-		"istio/mesh/v1alpha1/MeshConfig",
-		"type.googleapis.com/istio.mesh.v1alpha1.MeshConfig")
-
-	for _, k := range p.args.ExcludedResourceKinds {
-		spec := kubeMeta.Types.Get(k)
-		if spec != nil {
-			b.UnregisterInfo(spec.Target)
-		}
+func (p *Processing) createSourceAndStatusUpdater(schemas collection.Schemas) (
+	src event.Source, updater snapshotter.StatusUpdater, err error) {
+	var k kube.Interfaces
+	if k, err = p.getKubeInterfaces(); err != nil {
+		return
 	}
 
-	return b.Build()
+	var statusCtl status.Controller
+	if p.args.EnableConfigAnalysis {
+		statusCtl = status.NewController("validationMessages")
+	}
+
+	o := apiserver.Options{
+		Client:            k,
+		WatchedNamespaces: p.args.WatchedNamespaces,
+		ResyncPeriod:      p.args.ResyncPeriod,
+		Schemas:           schemas,
+		StatusController:  statusCtl,
+	}
+	s := apiserver.New(o)
+	src = s
+	updater = s
+
+	return
 }
 
 // Stop implements process.Component
@@ -333,63 +155,8 @@ func (p *Processing) Stop() {
 		p.stopCh = nil
 	}
 
-	if p.grpcServer != nil {
-		p.grpcServer.GracefulStop()
-		p.grpcServer = nil
+	if p.runtime != nil {
+		p.runtime.Stop()
+		p.runtime = nil
 	}
-
-	if p.processor != nil {
-		p.processor.Stop()
-		p.processor = nil
-	}
-
-	p.listenerMutex.Lock()
-	if p.listener != nil {
-		_ = p.listener.Close()
-		p.listener = nil
-	}
-	p.listenerMutex.Unlock()
-
-	if p.reporter != nil {
-		_ = p.reporter.Close()
-		p.reporter = nil
-	}
-
-	if p.callOut != nil {
-		p.callOut.stop()
-		p.callOut = nil
-	}
-
-	if p.grpcServer != nil || p.callOut != nil {
-		p.serveWG.Wait()
-	}
-
-	// final attempt to purge buffered logs
-	_ = log.Sync()
-}
-
-func (p *Processing) getListener() net.Listener {
-	p.listenerMutex.Lock()
-	defer p.listenerMutex.Unlock()
-	return p.listener
-}
-
-// Address returns the Address of the MCP service.
-func (p *Processing) Address() net.Addr {
-	l := p.getListener()
-	if l == nil {
-		return nil
-	}
-	return l.Addr()
-}
-
-func parseSinkMeta(pairs []string, md grpcMetadata.MD) error {
-	for _, p := range pairs {
-		kv := strings.Split(p, "=")
-		if len(kv) != 2 || kv[0] == "" || kv[1] == "" {
-			return fmt.Errorf("sinkMeta not in key=value format: %v", p)
-		}
-		md[kv[0]] = append(md[kv[0]], kv[1])
-	}
-	return nil
 }

@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,31 +15,35 @@ package cmd
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 	"testing"
-
-	"istio.io/istio/pilot/pkg/model"
 )
 
 func TestKubeInject(t *testing.T) {
 	cases := []testCase{
 		{ // case 0
-			configs:        []model.Config{},
 			args:           strings.Split("kube-inject", " "),
-			expectedOutput: "Error: filename not specified (see --filename or -f)\n",
+			expectedRegexp: regexp.MustCompile(`filename not specified \(see --filename or -f\)`),
 			wantException:  true,
 		},
 		{ // case 1
-			configs:        []model.Config{},
 			args:           strings.Split("kube-inject -f missing.yaml", " "),
-			expectedOutput: "Error: open missing.yaml: no such file or directory\n",
+			expectedRegexp: regexp.MustCompile(`open missing.yaml: no such file or directory`),
 			wantException:  true,
 		},
 		{ // case 2
-			configs: []model.Config{},
 			args: strings.Split(
 				"kube-inject --meshConfigFile testdata/mesh-config.yaml"+
 					" --injectConfigFile testdata/inject-config.yaml -f testdata/deployment/hello.yaml"+
+					" --valuesFile testdata/inject-values.yaml",
+				" "),
+			goldenFilename: "testdata/deployment/hello.yaml.injected",
+		},
+		{ // case 3
+			args: strings.Split(
+				"kube-inject --meshConfigFile testdata/mesh-config.yaml"+
+					" --injectConfigFile testdata/inject-config-inline.yaml -f testdata/deployment/hello.yaml"+
 					" --valuesFile testdata/inject-values.yaml",
 				" "),
 			goldenFilename: "testdata/deployment/hello.yaml.injected",

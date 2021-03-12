@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,61 +19,90 @@ import (
 	"testing"
 
 	networking "istio.io/api/networking/v1alpha3"
+	"istio.io/istio/pkg/config"
 )
 
 func TestMergeGateways(t *testing.T) {
-	configGw1 := makeConfig("foo1", "not-default", "foo.bar.com", "name1", "http", 7, "ingressgateway")
-	configGw2 := makeConfig("foo2", "not-default", "*", "name2", "http", 7, "ingressgateway2")
-	configGw3 := makeConfig("foo3", "not-default", "*", "name3", "http", 8, "ingressgateway")
-	configGw4 := makeConfig("foo4", "not-default-2", "*", "name4", "tcp", 8, "ingressgateway")
+	gwHTTPFoo := makeConfig("foo1", "not-default", "foo.bar.com", "name1", "http", 7, "ingressgateway")
+	gwHTTPbar := makeConfig("bar1", "not-default", "bar.foo.com", "bname1", "http", 7, "ingressgateway")
+	gwHTTP2Wildcard := makeConfig("foo5", "not-default", "*", "name5", "http2", 8, "ingressgateway")
+	gwHTTPWildcard := makeConfig("foo3", "not-default", "*", "name3", "http", 8, "ingressgateway")
+	gwTCPWildcard := makeConfig("foo4", "not-default-2", "*", "name4", "tcp", 8, "ingressgateway")
 
+	gwHTTPWildcardAlternate := makeConfig("foo2", "not-default", "*", "name2", "http", 7, "ingressgateway2")
+
+	// TODO(ramaraochavali): Add more test cases here.
 	tests := []struct {
-		name        string
-		gwConfig    []Config
-		serversNum  int
-		routesNum   int
-		gatewaysNum int
+		name               string
+		gwConfig           []config.Config
+		mergedServersNum   int
+		serverNum          int
+		serversForRouteNum map[string]int
+		gatewaysNum        int
 	}{
 		{
 			"single-server-config",
-			[]Config{configGw1},
+			[]config.Config{gwHTTPFoo},
 			1,
 			1,
+			map[string]int{"http.7": 1},
 			1,
 		},
 		{
+			"two servers on the same port",
+			[]config.Config{gwHTTPFoo, gwHTTPbar},
+			1,
+			2,
+			map[string]int{"http.7": 2},
+			2,
+		},
+		{
 			"same-server-config",
-			[]Config{configGw1, configGw2},
+			[]config.Config{gwHTTPFoo, gwHTTPWildcardAlternate},
 			1,
-			1,
+			2,
+			map[string]int{"http.7": 2},
 			2,
 		},
 		{
 			"multi-server-config",
-			[]Config{configGw1, configGw2, configGw3},
+			[]config.Config{gwHTTPFoo, gwHTTPWildcardAlternate, gwHTTPWildcard},
 			2,
-			2,
+			3,
+			map[string]int{"http.7": 2, "http.8": 1},
 			3,
 		},
 		{
-			"http-tcp-server-config",
-			[]Config{configGw1, configGw4},
+			"http-tcp-wildcard-server-config",
+			[]config.Config{gwHTTPFoo, gwTCPWildcard},
 			2,
+			2,
+			map[string]int{"http.7": 1},
+			2,
+		},
+		{
+			"tcp-http-server-config",
+			[]config.Config{gwTCPWildcard, gwHTTPWildcard},
 			1,
+			1,
+			map[string]int{},
 			2,
 		},
 		{
 			"tcp-tcp-server-config",
-			[]Config{configGw4, configGw3},
+			[]config.Config{gwHTTPWildcard, gwTCPWildcard}, // order matters
 			1,
-			0,
+			1,
+			map[string]int{"http.8": 1},
 			2,
 		},
 		{
-			"tcp-tcp-server-config",
-			[]Config{configGw3, configGw4}, //order matters
+			"http-http2-server-config",
+			[]config.Config{gwHTTPWildcard, gwHTTP2Wildcard},
 			1,
-			1,
+			2,
+			// http and http2 both present
+			map[string]int{"http.8": 2},
 			2,
 		},
 	}
@@ -81,11 +110,23 @@ func TestMergeGateways(t *testing.T) {
 	for idx, tt := range tests {
 		t.Run(fmt.Sprintf("[%d] %s", idx, tt.name), func(t *testing.T) {
 			mgw := MergeGateways(tt.gwConfig...)
-			if len(mgw.Servers) != tt.serversNum {
-				t.Errorf("Incorrect number of servers. Expected: %v Got: %d", tt.serversNum, len(mgw.Servers))
+			if len(mgw.MergedServers) != tt.mergedServersNum {
+				t.Errorf("Incorrect number of merged servers. Expected: %v Got: %d", tt.mergedServersNum, len(mgw.MergedServers))
 			}
-			if len(mgw.ServersByRouteName) != tt.routesNum {
-				t.Errorf("Incorrect number of routes. Expected: %v Got: %d", tt.routesNum, len(mgw.ServersByRouteName))
+			if len(mgw.ServersByRouteName) != len(tt.serversForRouteNum) {
+				t.Errorf("Incorrect number of routes. Expected: %v Got: %d", len(tt.serversForRouteNum), len(mgw.ServersByRouteName))
+				for k, v := range mgw.ServersByRouteName {
+					if tt.serversForRouteNum[k] != len(v) {
+						t.Errorf("for route %v expected %v servers got %v", k, tt.serversForRouteNum[k], len(v))
+					}
+				}
+			}
+			ns := 0
+			for _, ms := range mgw.MergedServers {
+				ns += len(ms.Servers)
+			}
+			if ns != tt.serverNum {
+				t.Errorf("Incorrect number of total servers. Expected: %v Got: %d", tt.serverNum, ns)
 			}
 			if len(mgw.GatewayNameForServer) != tt.gatewaysNum {
 				t.Errorf("Incorrect number of gateways. Expected: %v Got: %d", tt.gatewaysNum, len(mgw.GatewayNameForServer))
@@ -94,9 +135,9 @@ func TestMergeGateways(t *testing.T) {
 	}
 }
 
-func makeConfig(name, namespace, host, portName, portProtocol string, portNumber uint32, gw string) Config {
-	c := Config{
-		ConfigMeta: ConfigMeta{
+func makeConfig(name, namespace, host, portName, portProtocol string, portNumber uint32, gw string) config.Config {
+	c := config.Config{
+		Meta: config.Meta{
 			Name:      name,
 			Namespace: namespace,
 		},

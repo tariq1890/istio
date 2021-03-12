@@ -1,4 +1,4 @@
-//  Copyright 2018 Istio Authors
+//  Copyright Istio Authors
 //
 //  Licensed under the Apache License, Version 2.0 (the "License");
 //  you may not use this file except in compliance with the License.
@@ -15,63 +15,71 @@
 package kube
 
 import (
-	"istio.io/istio/pkg/test/deployment"
-	"istio.io/istio/pkg/test/framework/components/environment"
-	"istio.io/istio/pkg/test/framework/components/environment/api"
+	"istio.io/istio/pkg/test/framework/components/cluster"
+	"istio.io/istio/pkg/test/framework/components/cluster/clusterboot"
 	"istio.io/istio/pkg/test/framework/resource"
-	"istio.io/istio/pkg/test/kube"
 	"istio.io/istio/pkg/test/scopes"
 )
 
 // Environment is the implementation of a kubernetes environment. It implements environment.Environment,
 // and also hosts publicly accessible methods that are specific to cluster environment.
 type Environment struct {
-	id resource.ID
-
-	ctx api.Context
-	*kube.Accessor
-	s *Settings
+	id       resource.ID
+	ctx      resource.Context
+	clusters []cluster.Cluster
+	s        *Settings
 }
 
 var _ resource.Environment = &Environment{}
 
 // New returns a new Kubernetes environment
-func New(ctx api.Context) (resource.Environment, error) {
-	s, err := newSettingsFromCommandline()
-	if err != nil {
-		return nil, err
-	}
-
-	scopes.CI.Infof("Test Framework Kubernetes environment Settings:\n%s", s)
-
-	workDir, err := ctx.CreateTmpDirectory("env-kube")
-	if err != nil {
-		return nil, err
-	}
-
+func New(ctx resource.Context, s *Settings) (resource.Environment, error) {
+	scopes.Framework.Infof("Test Framework Kubernetes environment Settings:\n%s", s)
 	e := &Environment{
 		ctx: ctx,
 		s:   s,
 	}
 	e.id = ctx.TrackResource(e)
 
-	if e.Accessor, err = kube.NewAccessor(s.KubeConfig, workDir); err != nil {
+	configs, err := s.clusterConfigs()
+	if err != nil {
 		return nil, err
 	}
+	clusters, err := clusterboot.NewFactory().With(configs...).Build()
+	if err != nil {
+		return nil, err
+	}
+	e.clusters = clusters
 
 	return e, nil
 }
 
-// EnvironmentName implements environment.Instance
-func (e *Environment) EnvironmentName() environment.Name {
-	return environment.Kube
+func (e *Environment) EnvironmentName() string {
+	return "Kube"
 }
 
-// EnvironmentName implements environment.Instance
-func (e *Environment) Case(name environment.Name, fn func()) {
-	if name == e.EnvironmentName() {
-		fn()
+func (e *Environment) IsMulticluster() bool {
+	return len(e.clusters) > 1
+}
+
+// IsMultinetwork returns true if there is more than one network name in networkTopology.
+func (e *Environment) IsMultinetwork() bool {
+	return len(e.ClustersByNetwork()) > 1
+}
+
+func (e *Environment) Clusters() cluster.Clusters {
+	out := make([]cluster.Cluster, 0, len(e.clusters))
+	out = append(out, e.clusters...)
+	return out
+}
+
+// ClustersByNetwork returns an inverse mapping of the network topolgoy to a slice of clusters in a given network.
+func (e *Environment) ClustersByNetwork() map[string][]cluster.Cluster {
+	out := make(map[string][]cluster.Cluster)
+	for _, c := range e.clusters {
+		out[c.NetworkName()] = append(out[c.NetworkName()], c)
 	}
+	return out
 }
 
 // ID implements resource.Instance
@@ -81,35 +89,4 @@ func (e *Environment) ID() resource.ID {
 
 func (e *Environment) Settings() *Settings {
 	return e.s.clone()
-}
-
-// ApplyContents applies the given yaml contents to the namespace.
-func (e *Environment) ApplyContents(namespace, yml string) error {
-	_, err := e.Accessor.ApplyContents(namespace, yml)
-	return err
-}
-
-// Applies the config in the given filename to the namespace.
-func (e *Environment) Apply(namespace, ymlFile string) error {
-	return e.Accessor.Apply(namespace, ymlFile)
-}
-
-// Deletes the given yaml contents from the namespace.
-func (e *Environment) DeleteContents(namespace, yml string) error {
-	return e.Accessor.DeleteContents(namespace, yml)
-}
-
-// Deletes the config in the given filename from the namespace.
-func (e *Environment) Delete(namespace, ymlFile string) error {
-	return e.Accessor.Delete(namespace, ymlFile)
-}
-
-func (e *Environment) DeployYaml(namespace, yamlFile string) (*deployment.Instance, error) {
-	i := deployment.NewYamlDeployment(namespace, yamlFile)
-
-	err := i.Deploy(e.Accessor, true)
-	if err != nil {
-		return nil, err
-	}
-	return i, nil
 }

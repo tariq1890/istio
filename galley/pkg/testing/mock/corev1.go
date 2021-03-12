@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -27,6 +27,7 @@ type corev1Impl struct {
 	services   corev1.ServiceInterface
 	endpoints  corev1.EndpointsInterface
 	namespaces corev1.NamespaceInterface
+	configmaps corev1.ConfigMapInterface
 }
 
 func (c *corev1Impl) Nodes() corev1.NodeInterface {
@@ -54,7 +55,7 @@ func (c *corev1Impl) ComponentStatuses() corev1.ComponentStatusInterface {
 }
 
 func (c *corev1Impl) ConfigMaps(namespace string) corev1.ConfigMapInterface {
-	panic("not implemented")
+	return c.configmaps
 }
 
 func (c *corev1Impl) Events(namespace string) corev1.EventInterface {

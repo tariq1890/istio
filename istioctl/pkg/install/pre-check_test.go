@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors.
+// Copyright Istio Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -23,7 +23,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/version"
-	"k8s.io/cli-runtime/pkg/genericclioptions/resource"
+	"k8s.io/cli-runtime/pkg/genericclioptions"
 )
 
 type mockClientExecPreCheckConfig struct {
@@ -31,6 +31,7 @@ type mockClientExecPreCheckConfig struct {
 	version    *version.Info
 	authConfig *authorizationapi.SelfSubjectAccessReview
 }
+
 type testcase struct {
 	description       string
 	config            *mockClientExecPreCheckConfig
@@ -38,20 +39,20 @@ type testcase struct {
 }
 
 var (
-	version1_13 = &version.Info{
+	version1_17 = &version.Info{
 		Major:      "1",
-		Minor:      "13",
-		GitVersion: "1.13",
+		Minor:      "17",
+		GitVersion: "1.17",
 	}
 	version1_8 = &version.Info{
 		Major:      "1",
 		Minor:      "8",
 		GitVersion: "1.8",
 	}
-	version1_12GKE = &version.Info{
+	version1_17GKE = &version.Info{
 		Major:      "1",
-		Minor:      "12+",
-		GitVersion: "v1.12.7-gke.10",
+		Minor:      "17+",
+		GitVersion: "v1.17.7-gke.10",
 	}
 	version1_8GKE = &version.Info{
 		Major:      "1",
@@ -86,36 +87,39 @@ func TestPreCheck(t *testing.T) {
 		{
 			description: "Valid Kubernetes Version against GKE",
 			config: &mockClientExecPreCheckConfig{
-				version:   version1_12GKE,
+				version:   version1_17GKE,
 				namespace: "test",
 			},
 			expectedException: false,
 		},
 		{
-			description: "Inalid Kubernetes Version against GKE",
+			description: "Invalid Kubernetes Version against GKE",
 			config: &mockClientExecPreCheckConfig{
 				version:   version1_8GKE,
 				namespace: "test",
 			},
 			expectedException: true,
 		},
-		{description: "Invalid Istio System",
+		{
+			description: "Invalid Istio System",
 			config: &mockClientExecPreCheckConfig{
-				version:   version1_13,
+				version:   version1_17,
 				namespace: "istio-system",
 			},
-			expectedException: true,
+			expectedException: false, // It is fine to precheck an existing namespace; we might be installing canary control plane
 		},
-		{description: "Valid Istio System",
+		{
+			description: "Valid Istio System",
 			config: &mockClientExecPreCheckConfig{
-				version:   version1_13,
+				version:   version1_17,
 				namespace: "test",
 			},
 			expectedException: false,
 		},
-		{description: "Lacking Permission",
+		{
+			description: "Lacking Permission",
 			config: &mockClientExecPreCheckConfig{
-				version:   version1_13,
+				version:   version1_17,
 				namespace: "test",
 				authConfig: &authorizationapi.SelfSubjectAccessReview{
 					Spec: authorizationapi.SelfSubjectAccessReviewSpec{
@@ -131,9 +135,10 @@ func TestPreCheck(t *testing.T) {
 			},
 			expectedException: true,
 		},
-		{description: "Valid Case",
+		{
+			description: "Valid Case",
 			config: &mockClientExecPreCheckConfig{
-				version:   version1_13,
+				version:   version1_17,
 				namespace: "test",
 			},
 		},
@@ -149,26 +154,29 @@ func TestPreCheck(t *testing.T) {
 func verifyOutput(t *testing.T, c testcase) {
 	t.Helper()
 
-	clientExecFactory = mockPreCheckClient(c.config)
+	clientFactory = mockPreCheckClient(c.config)
 	var out bytes.Buffer
-	verifyInstallCmd := NewVerifyCommand()
-	verifyInstallCmd.SetOutput(&out)
-	fErr := verifyInstallCmd.Execute()
+	precheckCmd := NewPrecheckCommand()
+	// Avoid parse `go test` args
+	precheckCmd.SetArgs([]string{})
+	precheckCmd.SetOut(&out)
+	precheckCmd.SetErr(&out)
+	fErr := precheckCmd.Execute()
 	output := out.String()
 	if c.expectedException {
 		if fErr == nil {
-			t.Fatalf("Wanted an exception for 'istioctl verify-install',"+
+			t.Fatalf("Wanted an exception for 'istioctl x precheck',"+
 				"didn't get one, output was %q", output)
 		}
 	} else {
 		if fErr != nil {
-			t.Fatalf("Unwanted exception for 'istioctl verify-install': %v", fErr)
+			t.Fatalf("Unwanted exception for 'istioctl x precheck': %v", fErr)
 		}
 	}
 }
 
-func mockPreCheckClient(m *mockClientExecPreCheckConfig) func(restClientGetter resource.RESTClientGetter) (preCheckExecClient, error) {
-	outfunction := func(restClientGetter resource.RESTClientGetter) (preCheckExecClient, error) {
+func mockPreCheckClient(m *mockClientExecPreCheckConfig) func(restClientGetter genericclioptions.RESTClientGetter) (preCheckExecClient, error) {
+	outfunction := func(restClientGetter genericclioptions.RESTClientGetter) (preCheckExecClient, error) {
 		return m, nil
 	}
 	return outfunction
@@ -190,7 +198,6 @@ func (m *mockClientExecPreCheckConfig) getNameSpace(ns string) (*v1.Namespace, e
 		return n, nil
 	}
 	return nil, fmt.Errorf("namespaces \"%s\" not found", ns)
-
 }
 
 func (m *mockClientExecPreCheckConfig) checkAuthorization(
@@ -213,9 +220,12 @@ func (m *mockClientExecPreCheckConfig) checkAuthorization(
 		},
 	}
 	return authConfig, nil
-
 }
 
 func (m *mockClientExecPreCheckConfig) checkMutatingWebhook() error {
 	return nil
+}
+
+func (m *mockClientExecPreCheckConfig) getIstioInstalls() ([]istioInstall, error) {
+	return []istioInstall{}, nil
 }

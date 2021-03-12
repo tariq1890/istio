@@ -1,4 +1,5 @@
-// Copyright 2019 Istio Authors. All Rights Reserved.
+// +build integ
+// Copyright Istio Authors. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,35 +17,39 @@ package tracing
 
 import (
 	"fmt"
-	"testing"
 
-	"istio.io/istio/pkg/test/framework/components/bookinfo"
-	"istio.io/istio/pkg/test/framework/components/galley"
-	"istio.io/istio/pkg/test/framework/components/ingress"
+	"istio.io/istio/pkg/config/protocol"
+	"istio.io/istio/pkg/test/framework"
+	"istio.io/istio/pkg/test/framework/components/cluster"
+	"istio.io/istio/pkg/test/framework/components/echo"
+	"istio.io/istio/pkg/test/framework/components/echo/echoboot"
 	"istio.io/istio/pkg/test/framework/components/istio"
+	"istio.io/istio/pkg/test/framework/components/istio/ingress"
 	"istio.io/istio/pkg/test/framework/components/namespace"
 	"istio.io/istio/pkg/test/framework/components/zipkin"
 	"istio.io/istio/pkg/test/framework/resource"
+	"istio.io/istio/tests/integration/telemetry"
 )
 
 var (
+	client, server echo.Instances
 	ist            istio.Instance
-	bookinfoNsInst namespace.Instance
-	galInst        galley.Instance
 	ingInst        ingress.Instance
 	zipkinInst     zipkin.Instance
+	appNsInst      namespace.Instance
 )
 
-func GetGalleyInstance() galley.Instance {
-	return galInst
-}
+const (
+	TraceHeader = "x-client-trace-id"
+)
 
 func GetIstioInstance() *istio.Instance {
 	return &ist
 }
 
-func GetBookinfoNamespaceInstance() namespace.Instance {
-	return bookinfoNsInst
+// GetAppNamespace gets echo app namespace instance.
+func GetAppNamespace() namespace.Instance {
+	return appNsInst
 }
 
 func GetIngressInstance() ingress.Instance {
@@ -56,77 +61,86 @@ func GetZipkinInstance() zipkin.Instance {
 }
 
 func TestSetup(ctx resource.Context) (err error) {
-	galInst, err = galley.New(ctx, galley.Config{})
+	appNsInst, err = namespace.New(ctx, namespace.Config{
+		Prefix: "echo",
+		Inject: true,
+	})
 	if err != nil {
 		return
 	}
-	bookinfoNsInst, err = namespace.New(ctx, "istio-bookinfo", true)
+	builder := echoboot.NewBuilder(ctx)
+	for _, c := range ctx.Clusters() {
+		clName := c.Name()
+		builder = builder.
+			WithConfig(echo.Config{
+				Service:   fmt.Sprintf("client-%s", clName),
+				Namespace: appNsInst,
+				Cluster:   c,
+				Ports:     nil,
+				Subsets:   []echo.SubsetConfig{{}},
+			}).
+			WithConfig(echo.Config{
+				Service:   "server",
+				Namespace: appNsInst,
+				Cluster:   c,
+				Subsets:   []echo.SubsetConfig{{}},
+				Ports: []echo.Port{
+					{
+						Name:         "http",
+						Protocol:     protocol.HTTP,
+						InstancePort: 8090,
+					},
+					{
+						Name:     "tcp",
+						Protocol: protocol.TCP,
+						// We use a port > 1024 to not require root
+						InstancePort: 9000,
+					},
+				},
+			})
+	}
+	echos, err := builder.Build()
+	if err != nil {
+		return err
+	}
+	client = echos.Match(echo.ServicePrefix("client"))
+	server = echos.Match(echo.Service("server"))
+	ingInst = ist.IngressFor(ctx.Clusters().Default())
+	zipkinInst, err = zipkin.New(ctx, zipkin.Config{Cluster: ctx.Clusters().Default(), IngressAddr: ingInst.HTTPAddress()})
 	if err != nil {
 		return
 	}
-	if _, err = bookinfo.Deploy(ctx, bookinfo.Config{Namespace: bookinfoNsInst, Cfg: bookinfo.BookInfo}); err != nil {
-		return
-	}
-	ingInst, err = ingress.New(ctx, ingress.Config{Istio: ist})
-	if err != nil {
-		return
-	}
-	zipkinInst, err = zipkin.New(ctx)
-	if err != nil {
-		return
-	}
-	// deploy bookinfo app, also deploy a virtualservice which forces all traffic to go to review v1,
-	// which does not get ratings, so that exactly six spans will be included in the wanted trace.
-	bookingfoGatewayFile, err := bookinfo.NetworkingBookinfoGateway.LoadGatewayFileWithNamespace(bookinfoNsInst.Name())
-	if err != nil {
-		return
-	}
-	destinationRule, err := bookinfo.GetDestinationRuleConfigFile(ctx)
-	if err != nil {
-		return
-	}
-	destinationRuleFile, err := destinationRule.LoadWithNamespace(bookinfoNsInst.Name())
-	if err != nil {
-		return
-	}
-	virtualServiceFile, err := bookinfo.NetworkingVirtualServiceAllV1.LoadWithNamespace(bookinfoNsInst.Name())
-	if err != nil {
-		return
-	}
-	err = galInst.ApplyConfig(
-		bookinfoNsInst,
-		bookingfoGatewayFile,
-		destinationRuleFile,
-		virtualServiceFile,
-	)
-	if err != nil {
-		return
-	}
+
 	return nil
 }
 
-func VerifyBookinfoTraces(t *testing.T, namespace string, traces []zipkin.Trace) bool {
-	wtr := WantTraceRoot(namespace)
+func VerifyEchoTraces(ctx framework.TestContext, namespace, clName string, traces []zipkin.Trace) bool {
+	wtr := WantTraceRoot(namespace, clName)
 	for _, trace := range traces {
 		// compare each candidate trace with the wanted trace
 		for _, s := range trace.Spans {
-			// find the root span of candidate trace and do recursive comparation
-			if s.ParentSpanID == "" && CompareTrace(t, s, wtr) {
+			// find the root span of candidate trace and do recursive comparison
+			if s.ParentSpanID == "" && CompareTrace(ctx, s, wtr) {
 				return true
 			}
 		}
 	}
+
 	return false
 }
 
 // compareTrace recursively compares the two given spans
-func CompareTrace(t *testing.T, got, want zipkin.Span) bool {
+func CompareTrace(t framework.TestContext, got, want zipkin.Span) bool {
 	if got.Name != want.Name || got.ServiceName != want.ServiceName {
 		t.Logf("got span %+v, want span %+v", got, want)
 		return false
 	}
-	if len(got.ChildSpans) != len(want.ChildSpans) {
+	if len(got.ChildSpans) < len(want.ChildSpans) {
 		t.Logf("got %d child spans from, want %d child spans, maybe trace has not be fully reported",
+			len(got.ChildSpans), len(want.ChildSpans))
+		return false
+	} else if len(got.ChildSpans) > len(want.ChildSpans) {
+		t.Logf("got %d child spans from, want %d child spans, maybe destination rule has not became effective",
 			len(got.ChildSpans), len(want.ChildSpans))
 		return false
 	}
@@ -139,34 +153,37 @@ func CompareTrace(t *testing.T, got, want zipkin.Span) bool {
 }
 
 // wantTraceRoot constructs the wanted trace and returns the root span of that trace
-func WantTraceRoot(namespace string) (root zipkin.Span) {
-	reviewServerSpan := zipkin.Span{
-		Name:        fmt.Sprintf("reviews.%s.svc.cluster.local:9080/*", namespace),
-		ServiceName: fmt.Sprintf("reviews.%s", namespace),
+func WantTraceRoot(namespace, clName string) (root zipkin.Span) {
+	serverSpan := zipkin.Span{
+		Name:        fmt.Sprintf("server.%s.svc.cluster.local:80/*", namespace),
+		ServiceName: fmt.Sprintf("server.%s", namespace),
 	}
-	reviewClientSpan := zipkin.Span{
-		Name:        fmt.Sprintf("reviews.%s.svc.cluster.local:9080/*", namespace),
-		ServiceName: fmt.Sprintf("productpage.%s", namespace),
-		ChildSpans:  []*zipkin.Span{&reviewServerSpan},
-	}
-	detailServerSpan := zipkin.Span{
-		Name:        fmt.Sprintf("details.%s.svc.cluster.local:9080/*", namespace),
-		ServiceName: fmt.Sprintf("details.%s", namespace),
-	}
-	detailClientSpan := zipkin.Span{
-		Name:        fmt.Sprintf("details.%s.svc.cluster.local:9080/*", namespace),
-		ServiceName: fmt.Sprintf("productpage.%s", namespace),
-		ChildSpans:  []*zipkin.Span{&detailServerSpan},
-	}
-	productpageServerSpan := zipkin.Span{
-		Name:        fmt.Sprintf("productpage.%s.svc.cluster.local:9080/productpage", namespace),
-		ServiceName: fmt.Sprintf("productpage.%s", namespace),
-		ChildSpans:  []*zipkin.Span{&detailClientSpan, &reviewClientSpan},
-	}
+
 	root = zipkin.Span{
-		Name:        fmt.Sprintf("productpage.%s.svc.cluster.local:9080/productpage", namespace),
-		ServiceName: fmt.Sprintf("istio-ingressgateway"),
-		ChildSpans:  []*zipkin.Span{&productpageServerSpan},
+		Name:        fmt.Sprintf("server.%s.svc.cluster.local:80/*", namespace),
+		ServiceName: fmt.Sprintf("client-%s.%s", clName, namespace),
+		ChildSpans:  []*zipkin.Span{&serverSpan},
 	}
 	return
+}
+
+// SendTraffic makes a client call to the "server" service on the http port.
+func SendTraffic(ctx framework.TestContext, headers map[string][]string, cl cluster.Cluster) error {
+	ctx.Logf("Sending from %s...", cl.Name())
+	for _, cltInstance := range client {
+		if cltInstance.Config().Cluster != cl {
+			continue
+		}
+
+		_, err := cltInstance.Call(echo.CallOptions{
+			Target:   server[0],
+			PortName: "http",
+			Count:    telemetry.RequestCountMultipler * len(server),
+			Headers:  headers,
+		})
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }

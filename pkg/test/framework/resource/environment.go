@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,23 +14,26 @@
 
 package resource
 
-import (
-	"fmt"
+import "istio.io/istio/pkg/test/framework/components/cluster"
 
-	"istio.io/istio/pkg/test/framework/components/environment"
-)
+// EnvironmentFactory creates an Environment.
+type EnvironmentFactory func(ctx Context) (Environment, error)
+
+var _ EnvironmentFactory = NilEnvironmentFactory
+
+// NilEnvironmentFactory is an EnvironmentFactory that returns nil.
+func NilEnvironmentFactory(Context) (Environment, error) {
+	return nil, nil
+}
 
 // Environment is the ambient environment that the test runs in.
 type Environment interface {
 	Resource
 
-	EnvironmentName() environment.Name
+	EnvironmentName() string
 
-	// Case calls the given function if this environment has the given name.
-	Case(e environment.Name, fn func())
-}
+	// Clusters in this Environment. There will always be at least one.
+	Clusters() cluster.Clusters
 
-// UnsupportedEnvironment generates an error indicating that the given environment is not supported.
-func UnsupportedEnvironment(env Environment) error {
-	return fmt.Errorf("unsupported environment: %q", string(env.EnvironmentName()))
+	IsMultinetwork() bool
 }

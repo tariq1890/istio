@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -25,7 +25,6 @@ import (
 type AnnotationType string
 
 const (
-	ServiceAnnotation  AnnotationType = "service"
 	WorkloadAnnotation AnnotationType = "workload"
 )
 
@@ -36,26 +35,13 @@ type Annotation struct {
 }
 
 var (
-	SidecarInject                         = workloadAnnotation(annotation.SidecarInject.Name, "true")
-	SidecarStatus                         = workloadAnnotation(annotation.SidecarStatus.Name, "")
-	SidecarRewriteAppHTTPProbers          = workloadAnnotation(annotation.SidecarRewriteAppHTTPProbers.Name, "")
-	SidecarProxyImage                     = workloadAnnotation(annotation.SidecarProxyImage.Name, "")
-	SidecarInterceptionMode               = workloadAnnotation(annotation.SidecarInterceptionMode.Name, "")
-	SidecarStatusPort                     = workloadAnnotation(annotation.SidecarStatusPort.Name, "")
-	SidecarReadinessInitialDelaySeconds   = workloadAnnotation(annotation.SidecarStatusReadinessInitialDelaySeconds.Name, "")
-	SidecarReadinessPeriodSeconds         = workloadAnnotation(annotation.SidecarStatusReadinessPeriodSeconds.Name, "")
-	SidecarReadinessFailoverThreshold     = workloadAnnotation(annotation.SidecarStatusReadinessFailureThreshold.Name, "")
-	SidecarApplicationPorts               = workloadAnnotation(annotation.SidecarStatusReadinessApplicationPorts.Name, "")
-	SidecarTrafficIncludeOutboundIPRanges = workloadAnnotation(annotation.SidecarTrafficIncludeOutboundIPRanges.Name, "")
-	SidecarTrafficExcludeOutboundIPRanges = workloadAnnotation(annotation.SidecarTrafficExcludeOutboundIPRanges.Name, "")
-	SidecarTrafficIncludeInboundPorts     = workloadAnnotation(annotation.SidecarTrafficIncludeInboundPorts.Name, "")
-	SidecarTrafficExcludeInboundPorts     = workloadAnnotation(annotation.SidecarTrafficExcludeInboundPorts.Name, "")
-	SidecarTrafficKubeVirtInterfaces      = workloadAnnotation(annotation.SidecarTrafficKubevirtInterfaces.Name, "")
-
-	KubeServiceAccountsOnVMA = serviceAnnotation(annotation.AlphaKubernetesServiceAccounts.Name, "")
-	CanonicalServiceAccounts = serviceAnnotation(annotation.AlphaCanonicalServiceAccounts.Name, "")
-	ServiceExport            = serviceAnnotation(annotation.NetworkingExportTo.Name, "")
-	WorkloadIdentity         = workloadAnnotation(annotation.AlphaIdentity.Name, "")
+	SidecarInject                = workloadAnnotation(annotation.SidecarInject.Name, "true")
+	SidecarRewriteAppHTTPProbers = workloadAnnotation(annotation.SidecarRewriteAppHTTPProbers.Name, "")
+	SidecarBootstrapOverride     = workloadAnnotation(annotation.SidecarBootstrapOverride.Name, "")
+	SidecarVolumeMount           = workloadAnnotation(annotation.SidecarUserVolumeMount.Name, "")
+	SidecarVolume                = workloadAnnotation(annotation.SidecarUserVolume.Name, "")
+	SidecarConfig                = workloadAnnotation(annotation.ProxyConfig.Name, "")
+	SidecarInterceptionMode      = workloadAnnotation(annotation.SidecarInterceptionMode.Name, "REDIRECT")
 )
 
 type AnnotationValue struct {
@@ -91,16 +77,6 @@ func (v *AnnotationValue) SetInt(arg int) *AnnotationValue {
 
 func NewAnnotationValue() *AnnotationValue {
 	return &AnnotationValue{}
-}
-
-func serviceAnnotation(name string, value string) Annotation {
-	return Annotation{
-		Name: name,
-		Type: ServiceAnnotation,
-		Default: AnnotationValue{
-			Value: value,
-		},
-	}
 }
 
 func workloadAnnotation(name string, value string) Annotation {
@@ -140,6 +116,15 @@ func (a Annotations) getOrDefault(k Annotation) *AnnotationValue {
 		anno = &k.Default
 	}
 	return anno
+}
+
+func (a Annotations) GetByName(k string) string {
+	for keys := range a {
+		if keys.Name == k {
+			return a.Get(keys)
+		}
+	}
+	return ""
 }
 
 func (a Annotations) Get(k Annotation) string {

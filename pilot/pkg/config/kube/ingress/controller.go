@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,19 +18,30 @@ package ingress
 
 import (
 	"errors"
+	"fmt"
 	"reflect"
+	"sort"
 	"time"
 
-	extensionsv1beta1 "k8s.io/api/extensions/v1beta1"
-	"k8s.io/client-go/informers/extensions/v1beta1"
+	ingress "k8s.io/api/networking/v1beta1"
+	kerrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/util/version"
+	"k8s.io/client-go/informers/networking/v1beta1"
 	"k8s.io/client-go/kubernetes"
+	listerv1 "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
 
 	meshconfig "istio.io/api/mesh/v1alpha1"
 	"istio.io/istio/pilot/pkg/model"
-	"istio.io/istio/pilot/pkg/serviceregistry/kube"
 	kubecontroller "istio.io/istio/pilot/pkg/serviceregistry/kube/controller"
 	"istio.io/istio/pkg/config"
+	"istio.io/istio/pkg/config/constants"
+	"istio.io/istio/pkg/config/mesh"
+	"istio.io/istio/pkg/config/schema/collection"
+	"istio.io/istio/pkg/config/schema/collections"
+	"istio.io/istio/pkg/config/schema/gvk"
+	"istio.io/istio/pkg/kube"
+	"istio.io/istio/pkg/queue"
 	"istio.io/pkg/env"
 	"istio.io/pkg/log"
 )
@@ -59,107 +70,223 @@ import (
 //   If we need more flexibility - we can add it (but likely we'll deprecate ingress support first)
 // -
 
+var schemas = collection.SchemasFor(
+	collections.IstioNetworkingV1Alpha3Virtualservices,
+	collections.IstioNetworkingV1Alpha3Gateways)
+
 // Control needs RBAC permissions to write to Pods.
 
 type controller struct {
-	mesh         *meshconfig.MeshConfig
+	meshWatcher  mesh.Holder
 	domainSuffix string
 
-	client   kubernetes.Interface
-	queue    kube.Queue
-	informer cache.SharedIndexInformer
-	handler  *kube.ChainHandler
+	queue                  queue.Instance
+	virtualServiceHandlers []func(config.Config, config.Config, model.Event)
+	gatewayHandlers        []func(config.Config, config.Config, model.Event)
+
+	ingressInformer cache.SharedInformer
+	serviceInformer cache.SharedInformer
+	serviceLister   listerv1.ServiceLister
+	// May be nil if ingress class is not supported in the cluster
+	classes v1beta1.IngressClassInformer
 }
 
-var (
-	// TODO: move to features ( and remove in 1.2 )
-	ingressNamespace = env.RegisterStringVar("K8S_INGRESS_NS", "", "").Get()
-)
+// TODO: move to features ( and remove in 1.2 )
+var ingressNamespace = env.RegisterStringVar("K8S_INGRESS_NS", "", "").Get()
 
-var (
-	errUnsupportedOp = errors.New("unsupported operation: the ingress config store is a read-only view")
-)
+var errUnsupportedOp = errors.New("unsupported operation: the ingress config store is a read-only view")
 
-// NewController creates a new Kubernetes controller
-func NewController(client kubernetes.Interface, mesh *meshconfig.MeshConfig,
-	options kubecontroller.Options) model.ConfigStoreCache {
-	handler := &kube.ChainHandler{}
+// Check if the "networking/v1" Ingress is available. Implementation borrowed from ingress-nginx
+func V1Available(client kubernetes.Interface) bool {
+	// check kubernetes version to use new ingress package or not
+	version119, _ := version.ParseGeneric("v1.19.0")
 
-	// queue requires a time duration for a retry delay after a handler error
-	queue := kube.NewQueue(1 * time.Second)
-
-	if ingressNamespace == "" {
-		ingressNamespace = config.IstioIngressNamespace
+	serverVersion, err := client.Discovery().ServerVersion()
+	if err != nil {
+		return false
 	}
 
-	log.Infof("Ingress controller watching namespaces %q", options.WatchedNamespace)
-	informer := v1beta1.NewFilteredIngressInformer(client, options.WatchedNamespace, options.ResyncPeriod, cache.Indexers{}, nil)
-	informer.AddEventHandler(
+	runningVersion, err := version.ParseGeneric(serverVersion.String())
+	if err != nil {
+		log.Errorf("unexpected error parsing running Kubernetes version: %v", err)
+		return false
+	}
+
+	return runningVersion.AtLeast(version119)
+}
+
+// Check if the "networking" group Ingress is available. Implementation borrowed from ingress-nginx
+func NetworkingIngressAvailable(client kubernetes.Interface) bool {
+	// check kubernetes version to use new ingress package or not
+	version118, _ := version.ParseGeneric("v1.18.0")
+
+	serverVersion, err := client.Discovery().ServerVersion()
+	if err != nil {
+		return false
+	}
+
+	runningVersion, err := version.ParseGeneric(serverVersion.String())
+	if err != nil {
+		log.Errorf("unexpected error parsing running Kubernetes version: %v", err)
+		return false
+	}
+
+	return runningVersion.AtLeast(version118)
+}
+
+// NewController creates a new Kubernetes controller
+func NewController(client kube.Client, meshWatcher mesh.Holder,
+	options kubecontroller.Options) model.ConfigStoreCache {
+	// queue requires a time duration for a retry delay after a handler error
+	q := queue.NewQueue(1 * time.Second)
+
+	if ingressNamespace == "" {
+		ingressNamespace = constants.IstioIngressNamespace
+	}
+
+	ingressInformer := client.KubeInformer().Networking().V1beta1().Ingresses().Informer()
+
+	serviceInformer := client.KubeInformer().Core().V1().Services()
+
+	var classes v1beta1.IngressClassInformer
+	if NetworkingIngressAvailable(client) {
+		classes = client.KubeInformer().Networking().V1beta1().IngressClasses()
+		// Register the informer now, so it will be properly started
+		_ = classes.Informer()
+	} else {
+		log.Infof("Skipping IngressClass, resource not supported")
+	}
+
+	c := &controller{
+		meshWatcher:     meshWatcher,
+		domainSuffix:    options.DomainSuffix,
+		queue:           q,
+		ingressInformer: ingressInformer,
+		classes:         classes,
+		serviceInformer: serviceInformer.Informer(),
+		serviceLister:   serviceInformer.Lister(),
+	}
+
+	ingressInformer.AddEventHandler(
 		cache.ResourceEventHandlerFuncs{
 			AddFunc: func(obj interface{}) {
-				queue.Push(kube.NewTask(handler.Apply, obj, model.EventAdd))
+				q.Push(func() error {
+					return c.onEvent(nil, obj, model.EventAdd)
+				})
 			},
 			UpdateFunc: func(old, cur interface{}) {
 				if !reflect.DeepEqual(old, cur) {
-					queue.Push(kube.NewTask(handler.Apply, cur, model.EventUpdate))
+					q.Push(func() error {
+						return c.onEvent(old, cur, model.EventUpdate)
+					})
 				}
 			},
 			DeleteFunc: func(obj interface{}) {
-				queue.Push(kube.NewTask(handler.Apply, obj, model.EventDelete))
+				q.Push(func() error {
+					return c.onEvent(nil, obj, model.EventDelete)
+				})
 			},
 		})
 
-	// first handler in the chain blocks until the cache is fully synchronized
-	// it does this by returning an error to the chain handler
-	handler.Append(func(obj interface{}, event model.Event) error {
-		if !informer.HasSynced() {
-			return errors.New("waiting till full synchronization")
-		}
-		if ingress, ok := obj.(*extensionsv1beta1.Ingress); ok {
-			log.Infof("ingress event %s for %s/%s", event, ingress.Namespace, ingress.Name)
-		}
-		return nil
-	})
+	return c
+}
 
-	return &controller{
-		mesh:         mesh,
-		domainSuffix: options.DomainSuffix,
-		client:       client,
-		queue:        queue,
-		informer:     informer,
-		handler:      handler,
+func (c *controller) shouldProcessIngress(mesh *meshconfig.MeshConfig, i *ingress.Ingress) (bool, error) {
+	var class *ingress.IngressClass
+	if c.classes != nil && i.Spec.IngressClassName != nil {
+		c, err := c.classes.Lister().Get(*i.Spec.IngressClassName)
+		if err != nil && !kerrors.IsNotFound(err) {
+			return false, fmt.Errorf("failed to get ingress class %v: %v", i.Spec.IngressClassName, err)
+		}
+		class = c
+	}
+	return shouldProcessIngressWithClass(mesh, i, class), nil
+}
+
+// shouldProcessIngressUpdate checks whether we should renotify registered handlers about an update event
+func (c *controller) shouldProcessIngressUpdate(oldObj, curObj interface{}) (bool, error) {
+	var shouldProcess bool
+
+	// should always have curObj passed
+	ing, ok := curObj.(*ingress.Ingress)
+	if !ok {
+		return false, nil
+	}
+
+	if oldObj == nil { // corresponds to additions and deletions of ingresses, update handlers if the current version should be targeted
+		shouldProcessUpdate, err := c.shouldProcessIngress(c.meshWatcher.Mesh(), ing)
+		if err != nil {
+			return false, err
+		}
+		shouldProcess = shouldProcessUpdate
+	} else { // this case corresponds to an update to an existing ingress resource
+		oldIng, ok := oldObj.(*ingress.Ingress)
+		if !ok {
+			return false, nil
+		}
+
+		shouldProcessOld, err := c.shouldProcessIngress(c.meshWatcher.Mesh(), oldIng)
+		if err != nil {
+			return false, err
+		}
+		shouldProcessNew, err := c.shouldProcessIngress(c.meshWatcher.Mesh(), ing)
+		if err != nil {
+			return false, err
+		}
+
+		// the singular case we want to ignore is where neither the old nor new version of the ingress
+		// should be targeted. otherwise we need to delete the ingress routes, add the ingress routes,
+		// or change something about the ingress configuration
+		shouldProcess = shouldProcessOld || shouldProcessNew
+	}
+	return shouldProcess, nil
+}
+
+func (c *controller) onEvent(oldObj, curObj interface{}, event model.Event) error {
+	if !c.HasSynced() {
+		return errors.New("waiting till full synchronization")
+	}
+
+	shouldProcess, err := c.shouldProcessIngressUpdate(oldObj, curObj)
+	if err != nil {
+		return err
+	}
+	if !shouldProcess {
+		return nil
+	}
+
+	// Trigger updates for Gateway and VirtualService
+	// TODO: we could be smarter here and only trigger when real changes were found
+	for _, f := range c.virtualServiceHandlers {
+		f(config.Config{}, config.Config{
+			Meta: config.Meta{
+				GroupVersionKind: gvk.VirtualService,
+			},
+		}, event)
+	}
+	for _, f := range c.gatewayHandlers {
+		f(config.Config{}, config.Config{
+			Meta: config.Meta{
+				GroupVersionKind: gvk.Gateway,
+			},
+		}, event)
+	}
+
+	return nil
+}
+
+func (c *controller) RegisterEventHandler(kind config.GroupVersionKind, f func(config.Config, config.Config, model.Event)) {
+	switch kind {
+	case gvk.VirtualService:
+		c.virtualServiceHandlers = append(c.virtualServiceHandlers, f)
+	case gvk.Gateway:
+		c.gatewayHandlers = append(c.gatewayHandlers, f)
 	}
 }
 
-func (c *controller) RegisterEventHandler(typ string, f func(model.Config, model.Event)) {
-	c.handler.Append(func(obj interface{}, event model.Event) error {
-		ingress, ok := obj.(*extensionsv1beta1.Ingress)
-		if !ok || !shouldProcessIngress(c.mesh, ingress) {
-			return nil
-		}
-
-		// In 1.0, Pilot has a single function, clearCache, which ignores
-		// the inputs.
-		// In future we may do smarter processing - but first we'll do
-		// major refactoring. No need to recompute everything and generate
-		// multiple events.
-
-		// TODO: This works well for Add and Delete events, but not so for Update:
-		// An updated ingress may also trigger an Add or Delete for one of its constituent sub-rules.
-		switch typ {
-		case model.Gateway.Type:
-			//config, _ := ConvertIngressV1alpha3(*ingress, c.domainSuffix)
-			//f(config, event)
-		case model.VirtualService.Type:
-			f(model.Config{}, event)
-		}
-
-		return nil
-	})
-}
-
 func (c *controller) HasSynced() bool {
-	return c.informer.HasSynced()
+	return c.ingressInformer.HasSynced() && c.serviceInformer.HasSynced() &&
+		(c.classes == nil || c.classes.Informer().HasSynced())
 }
 
 func (c *controller) Run(stop <-chan struct{}) {
@@ -167,69 +294,70 @@ func (c *controller) Run(stop <-chan struct{}) {
 		cache.WaitForCacheSync(stop, c.HasSynced)
 		c.queue.Run(stop)
 	}()
-	go c.informer.Run(stop)
 	<-stop
 }
 
-func (c *controller) ConfigDescriptor() model.ConfigDescriptor {
-	//TODO: are these two config descriptors right?
-	return model.ConfigDescriptor{model.Gateway, model.VirtualService}
+func (c *controller) Schemas() collection.Schemas {
+	// TODO: are these two config descriptors right?
+	return schemas
 }
 
-//TODO: we don't return out of this function now
-func (c *controller) Get(typ, name, namespace string) *model.Config {
-	if typ != model.Gateway.Type && typ != model.VirtualService.Type {
-		return nil
-	}
-
-	ingressName, _, _, err := decodeIngressRuleName(name)
-	if err != nil {
-		return nil
-	}
-
-	storeKey := kube.KeyFunc(ingressName, namespace)
-	obj, exists, err := c.informer.GetStore().GetByKey(storeKey)
-	if err != nil || !exists {
-		return nil
-	}
-
-	ingress := obj.(*extensionsv1beta1.Ingress)
-	if !shouldProcessIngress(c.mesh, ingress) {
-		return nil
-	}
-
+func (c *controller) Get(typ config.GroupVersionKind, name, namespace string) *config.Config {
 	return nil
 }
 
-func (c *controller) List(typ, namespace string) ([]model.Config, error) {
-	if typ != model.Gateway.Type && typ != model.VirtualService.Type {
+// sortIngressByCreationTime sorts the list of config objects in ascending order by their creation time (if available).
+func sortIngressByCreationTime(configs []interface{}) []*ingress.Ingress {
+	ingr := make([]*ingress.Ingress, 0, len(configs))
+	for _, i := range configs {
+		ingr = append(ingr, i.(*ingress.Ingress))
+	}
+	sort.SliceStable(ingr, func(i, j int) bool {
+		// If creation time is the same, then behavior is nondeterministic. In this case, we can
+		// pick an arbitrary but consistent ordering based on name and namespace, which is unique.
+		// CreationTimestamp is stored in seconds, so this is not uncommon.
+		if ingr[i].CreationTimestamp == ingr[j].CreationTimestamp {
+			in := ingr[i].Name + "." + ingr[i].Namespace
+			jn := ingr[j].Name + "." + ingr[j].Namespace
+			return in < jn
+		}
+		return ingr[i].CreationTimestamp.Before(&ingr[j].CreationTimestamp)
+	})
+	return ingr
+}
+
+func (c *controller) List(typ config.GroupVersionKind, namespace string) ([]config.Config, error) {
+	if typ != gvk.Gateway &&
+		typ != gvk.VirtualService {
 		return nil, errUnsupportedOp
 	}
 
-	out := make([]model.Config, 0)
+	out := make([]config.Config, 0)
 
-	ingressByHost := map[string]*model.Config{}
+	ingressByHost := map[string]*config.Config{}
 
-	for _, obj := range c.informer.GetStore().List() {
-		ingress := obj.(*extensionsv1beta1.Ingress)
+	for _, ingress := range sortIngressByCreationTime(c.ingressInformer.GetStore().List()) {
 		if namespace != "" && namespace != ingress.Namespace {
 			continue
 		}
-
-		if !shouldProcessIngress(c.mesh, ingress) {
+		process, err := c.shouldProcessIngress(c.meshWatcher.Mesh(), ingress)
+		if err != nil {
+			return nil, err
+		}
+		if !process {
 			continue
 		}
 
 		switch typ {
-		case model.VirtualService.Type:
-			ConvertIngressVirtualService(*ingress, c.domainSuffix, ingressByHost)
-		case model.Gateway.Type:
-			gateways := ConvertIngressV1alpha3(*ingress, c.domainSuffix)
+		case gvk.VirtualService:
+			ConvertIngressVirtualService(*ingress, c.domainSuffix, ingressByHost, c.serviceLister)
+		case gvk.Gateway:
+			gateways := ConvertIngressV1alpha3(*ingress, c.meshWatcher.Mesh(), c.domainSuffix)
 			out = append(out, gateways)
 		}
 	}
 
-	if typ == model.VirtualService.Type {
+	if typ == gvk.VirtualService {
 		for _, obj := range ingressByHost {
 			out = append(out, *obj)
 		}
@@ -238,14 +366,22 @@ func (c *controller) List(typ, namespace string) ([]model.Config, error) {
 	return out, nil
 }
 
-func (c *controller) Create(_ model.Config) (string, error) {
+func (c *controller) Create(_ config.Config) (string, error) {
 	return "", errUnsupportedOp
 }
 
-func (c *controller) Update(_ model.Config) (string, error) {
+func (c *controller) Update(_ config.Config) (string, error) {
 	return "", errUnsupportedOp
 }
 
-func (c *controller) Delete(_, _, _ string) error {
+func (c *controller) UpdateStatus(config.Config) (string, error) {
+	return "", errUnsupportedOp
+}
+
+func (c *controller) Patch(_ config.Config, _ config.PatchFunc) (string, error) {
+	return "", errUnsupportedOp
+}
+
+func (c *controller) Delete(_ config.GroupVersionKind, _, _ string, _ *string) error {
 	return errUnsupportedOp
 }

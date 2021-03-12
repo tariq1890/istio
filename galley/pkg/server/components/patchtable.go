@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,42 +15,23 @@
 package components
 
 import (
-	"io/ioutil"
-	"net"
-
-	"istio.io/pkg/filewatcher"
-
-	"istio.io/istio/galley/pkg/meshconfig"
-	"istio.io/istio/galley/pkg/source/fs"
-	kubeSource "istio.io/istio/galley/pkg/source/kube"
-	"istio.io/istio/galley/pkg/source/kube/client"
-	"istio.io/istio/galley/pkg/source/kube/schema/check"
-	"istio.io/istio/pkg/mcp/monitoring"
+	"istio.io/istio/galley/pkg/config/mesh"
+	"istio.io/istio/galley/pkg/config/processor"
+	"istio.io/istio/galley/pkg/config/source/kube"
+	"istio.io/istio/pkg/config/event"
 )
 
 // The patch table for external dependencies for code in components.
 var (
-	netListen                   = net.Listen
-	fsNew                       = fs.New
-	newKubeFromConfigFile       = client.NewKubeFromConfigFile
-	verifyResourceTypesPresence = check.ResourceTypesPresence
-	findSupportedResources      = check.FindSupportedResourceSchemas
-	newSource                   = kubeSource.New
-	mcpMetricReporter           = func(prefix string) monitoring.Reporter { return monitoring.NewStatsContext(prefix) }
-	newMeshConfigCache          = func(path string) (meshconfig.Cache, error) { return meshconfig.NewCacheFromFile(path) }
-	newFileWatcher              = filewatcher.NewWatcher
-	readFile                    = ioutil.ReadFile
+	newInterfaces = kube.NewInterfacesFromConfigFile
+
+	meshcfgNewFS        = func(path string) (event.Source, error) { return mesh.NewMeshConfigFS(path) }
+	processorInitialize = processor.Initialize
 )
 
 func resetPatchTable() {
-	netListen = net.Listen
-	fsNew = fs.New
-	newKubeFromConfigFile = client.NewKubeFromConfigFile
-	verifyResourceTypesPresence = check.ResourceTypesPresence
-	findSupportedResources = check.FindSupportedResourceSchemas
-	newSource = kubeSource.New
-	mcpMetricReporter = func(prefix string) monitoring.Reporter { return monitoring.NewStatsContext(prefix) }
-	newMeshConfigCache = func(path string) (meshconfig.Cache, error) { return meshconfig.NewCacheFromFile(path) }
-	newFileWatcher = filewatcher.NewWatcher
-	readFile = ioutil.ReadFile
+	newInterfaces = kube.NewInterfacesFromConfigFile
+
+	meshcfgNewFS = func(path string) (event.Source, error) { return mesh.NewMeshConfigFS(path) }
+	processorInitialize = processor.Initialize
 }

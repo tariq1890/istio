@@ -1,4 +1,4 @@
-//  Copyright 2018 Istio Authors
+//  Copyright Istio Authors
 //
 //  Licensed under the Apache License, Version 2.0 (the "License");
 //  you may not use this file except in compliance with the License.
@@ -17,13 +17,17 @@ package server
 import (
 	"fmt"
 	"io"
+	"net/http"
+	"os"
 	"sync"
 	"sync/atomic"
 
+	ocprom "contrib.go.opencensus.io/exporter/prometheus"
 	"github.com/hashicorp/go-multierror"
+	"github.com/prometheus/client_golang/prometheus"
+	"go.opencensus.io/stats/view"
 
-	"istio.io/istio/pilot/pkg/model"
-	"istio.io/istio/pkg/config"
+	"istio.io/istio/pkg/config/protocol"
 	"istio.io/istio/pkg/test/echo/common"
 	"istio.io/istio/pkg/test/echo/server/endpoint"
 	"istio.io/pkg/log"
@@ -31,12 +35,17 @@ import (
 
 // Config for an echo server Instance.
 type Config struct {
-	Ports     model.PortList
-	TLSCert   string
-	TLSKey    string
-	Version   string
-	UDSServer string
-	Dialer    common.Dialer
+	Ports                 common.PortList
+	BindIPPortsMap        map[int]struct{}
+	BindLocalhostPortsMap map[int]struct{}
+	Metrics               int
+	TLSCert               string
+	TLSKey                string
+	Version               string
+	UDSServer             string
+	Cluster               string
+	Dialer                common.Dialer
+	IstioVersion          string
 }
 
 var _ io.Closer = &Instance{}
@@ -45,8 +54,9 @@ var _ io.Closer = &Instance{}
 type Instance struct {
 	Config
 
-	endpoints []endpoint.Instance
-	ready     uint32
+	endpoints     []endpoint.Instance
+	metricsServer *http.Server
+	ready         uint32
 }
 
 // New creates a new server instance.
@@ -70,6 +80,9 @@ func (s *Instance) Start() (err error) {
 		return err
 	}
 
+	if s.Metrics > 0 {
+		go s.startMetricsServer()
+	}
 	s.endpoints = make([]endpoint.Instance, 0)
 	for _, p := range s.Ports {
 		ep, err := s.newEndpoint(p, "")
@@ -100,15 +113,40 @@ func (s *Instance) Close() (err error) {
 	return
 }
 
-func (s *Instance) newEndpoint(port *model.Port, udsServer string) (endpoint.Instance, error) {
+func (s *Instance) getListenerIP(port *common.Port) (string, error) {
+	// Not configured on this port, set to empty which will lead to wildcard bind
+	// Not 0.0.0.0 in case we want IPv6
+	if port == nil {
+		return "", nil
+	}
+	if _, f := s.BindLocalhostPortsMap[port.Port]; f {
+		return "localhost", nil
+	}
+	if _, f := s.BindIPPortsMap[port.Port]; !f {
+		return "", nil
+	}
+	if ip, f := os.LookupEnv("INSTANCE_IP"); f {
+		return ip, nil
+	}
+	return "", fmt.Errorf("--bind-ip set but INSTANCE_IP undefined")
+}
+
+func (s *Instance) newEndpoint(port *common.Port, udsServer string) (endpoint.Instance, error) {
+	ip, err := s.getListenerIP(port)
+	if err != nil {
+		return nil, err
+	}
 	return endpoint.New(endpoint.Config{
 		Port:          port,
 		UDSServer:     udsServer,
 		IsServerReady: s.isReady,
 		Version:       s.Version,
+		Cluster:       s.Cluster,
 		TLSCert:       s.TLSCert,
 		TLSKey:        s.TLSKey,
 		Dialer:        s.Dialer,
+		ListenerIP:    ip,
+		IstioVersion:  s.IstioVersion,
 	})
 }
 
@@ -144,14 +182,32 @@ func (s *Instance) waitUntilReady() error {
 func (s *Instance) validate() error {
 	for _, port := range s.Ports {
 		switch port.Protocol {
-		case config.ProtocolTCP:
-		case config.ProtocolHTTP:
-		case config.ProtocolHTTPS:
-		case config.ProtocolHTTP2:
-		case config.ProtocolGRPC:
+		case protocol.TCP:
+		case protocol.HTTP:
+		case protocol.HTTPS:
+		case protocol.HTTP2:
+		case protocol.GRPC:
 		default:
 			return fmt.Errorf("protocol %v not currently supported", port.Protocol)
 		}
 	}
 	return nil
+}
+
+func (s *Instance) startMetricsServer() {
+	mux := http.NewServeMux()
+
+	exporter, err := ocprom.NewExporter(ocprom.Options{Registry: prometheus.DefaultRegisterer.(*prometheus.Registry)})
+	if err != nil {
+		log.Errorf("could not set up prometheus exporter: %v", err)
+		return
+	}
+	view.RegisterExporter(exporter)
+	mux.Handle("/metrics", exporter)
+	s.metricsServer = &http.Server{
+		Handler: mux,
+	}
+	if err := http.ListenAndServe(fmt.Sprintf(":%d", s.Metrics), mux); err != nil {
+		log.Errorf("metrics terminated with err: %v", err)
+	}
 }

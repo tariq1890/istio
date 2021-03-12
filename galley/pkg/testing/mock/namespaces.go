@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,11 +15,14 @@
 package mock
 
 import (
+	"context"
 	"fmt"
 	"sync"
 
 	apicorev1 "k8s.io/api/core/v1"
+	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
 	corev1 "k8s.io/client-go/kubernetes/typed/core/v1"
@@ -39,7 +42,7 @@ func newNamespaceInterface() corev1.NamespaceInterface {
 	}
 }
 
-func (n *namespaceImpl) Create(obj *apicorev1.Namespace) (*apicorev1.Namespace, error) {
+func (n *namespaceImpl) Create(ctx context.Context, obj *apicorev1.Namespace, options metav1.CreateOptions) (*apicorev1.Namespace, error) {
 	n.mux.Lock()
 	defer n.mux.Unlock()
 
@@ -52,7 +55,18 @@ func (n *namespaceImpl) Create(obj *apicorev1.Namespace) (*apicorev1.Namespace, 
 	return obj, nil
 }
 
-func (n *namespaceImpl) Update(obj *apicorev1.Namespace) (*apicorev1.Namespace, error) {
+func (n *namespaceImpl) Get(ctx context.Context, name string, options metav1.GetOptions) (*apicorev1.Namespace, error) {
+	n.mux.Lock()
+	defer n.mux.Unlock()
+
+	obj, ok := n.namespaces[name]
+	if !ok {
+		return nil, kerrors.NewNotFound(schema.GroupResource{Resource: "namespaces"}, name)
+	}
+	return obj, nil
+}
+
+func (n *namespaceImpl) Update(ctx context.Context, obj *apicorev1.Namespace, options metav1.UpdateOptions) (*apicorev1.Namespace, error) {
 	n.mux.Lock()
 	defer n.mux.Unlock()
 
@@ -65,7 +79,7 @@ func (n *namespaceImpl) Update(obj *apicorev1.Namespace) (*apicorev1.Namespace, 
 	return obj, nil
 }
 
-func (n *namespaceImpl) Delete(name string, options *metav1.DeleteOptions) error {
+func (n *namespaceImpl) Delete(ctx context.Context, name string, options metav1.DeleteOptions) error {
 	n.mux.Lock()
 	defer n.mux.Unlock()
 
@@ -83,7 +97,7 @@ func (n *namespaceImpl) Delete(name string, options *metav1.DeleteOptions) error
 	return nil
 }
 
-func (n *namespaceImpl) List(opts metav1.ListOptions) (*apicorev1.NamespaceList, error) {
+func (n *namespaceImpl) List(ctx context.Context, opts metav1.ListOptions) (*apicorev1.NamespaceList, error) {
 	n.mux.Lock()
 	defer n.mux.Unlock()
 
@@ -96,7 +110,7 @@ func (n *namespaceImpl) List(opts metav1.ListOptions) (*apicorev1.NamespaceList,
 	return out, nil
 }
 
-func (n *namespaceImpl) Watch(opts metav1.ListOptions) (watch.Interface, error) {
+func (n *namespaceImpl) Watch(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
 	n.mux.Lock()
 	defer n.mux.Unlock()
 
@@ -114,26 +128,23 @@ func (n *namespaceImpl) Watch(opts metav1.ListOptions) (watch.Interface, error) 
 	return w, nil
 }
 
-func (n *namespaceImpl) UpdateStatus(*apicorev1.Namespace) (*apicorev1.Namespace, error) {
+func (n *namespaceImpl) UpdateStatus(context.Context, *apicorev1.Namespace, metav1.UpdateOptions) (*apicorev1.Namespace, error) {
 	panic("not implemented")
 }
 
-func (n *namespaceImpl) DeleteCollection(options *metav1.DeleteOptions, listOptions metav1.ListOptions) error {
+func (n *namespaceImpl) DeleteCollection(ctx context.Context, options *metav1.DeleteOptions, listOptions metav1.ListOptions) error {
 	panic("not implemented")
 }
 
-func (n *namespaceImpl) Get(name string, options metav1.GetOptions) (*apicorev1.Namespace, error) {
+func (n *namespaceImpl) Patch(ctx context.Context, name string, pt types.PatchType,
+	data []byte, options metav1.PatchOptions, subresources ...string) (result *apicorev1.Namespace, err error) {
 	panic("not implemented")
 }
 
-func (n *namespaceImpl) Patch(name string, pt types.PatchType, data []byte, subresources ...string) (result *apicorev1.Namespace, err error) {
+func (n *namespaceImpl) PatchStatus(ctx context.Context, namespaceName string, data []byte) (*apicorev1.Namespace, error) {
 	panic("not implemented")
 }
 
-func (n *namespaceImpl) PatchStatus(namespaceName string, data []byte) (*apicorev1.Namespace, error) {
-	panic("not implemented")
-}
-
-func (n *namespaceImpl) Finalize(item *apicorev1.Namespace) (*apicorev1.Namespace, error) {
+func (n *namespaceImpl) Finalize(ctx context.Context, item *apicorev1.Namespace, options metav1.UpdateOptions) (*apicorev1.Namespace, error) {
 	panic("not implemented")
 }

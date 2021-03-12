@@ -1,4 +1,4 @@
-//  Copyright 2019 Istio Authors
+//  Copyright Istio Authors
 //
 //  Licensed under the Apache License, Version 2.0 (the "License");
 //  you may not use this file except in compliance with the License.
@@ -16,45 +16,67 @@ package helm
 
 import (
 	"fmt"
+	"path/filepath"
+	"strings"
+	"time"
 
 	"istio.io/istio/pkg/test/scopes"
 	"istio.io/istio/pkg/test/shell"
 )
 
-// Init calls "helm init"
-func Init(homeDir string, clientOnly bool) error {
-	clientSuffix := ""
-	if clientOnly {
-		clientSuffix = " --client-only"
-	}
-
-	out, err := shell.Execute(true, "helm --home %s init %s", homeDir, clientSuffix)
-	if err != nil {
-		scopes.Framework.Errorf("helm init: %v, out:%q", err, out)
-	} else {
-		scopes.CI.Infof("helm init:\n%s\n", out)
-	}
-
-	return err
+// Helm allows clients to interact with helm commands in their cluster
+type Helm struct {
+	kubeConfig string
+	baseDir    string
 }
 
-func Template(homeDir, template, name, namespace string, valuesFile string, values map[string]string) (string, error) {
-	p := []string{"helm", "--home", homeDir, "template", template, "--name", name, "--namespace", namespace}
-	if valuesFile != "" {
-		p = append(p, "--values", valuesFile)
+// New returns a new instance of a helm object.
+func New(kubeConfig, baseWorkDir string) *Helm {
+	return &Helm{
+		kubeConfig: kubeConfig,
+		baseDir:    baseWorkDir,
 	}
+}
 
-	// Override the values in the helm value file.
-	for k, v := range values {
-		if k == "" {
-			continue
-		}
-		p = append(p, "--set", fmt.Sprintf("%s=%s", k, v))
-	}
-	out, err := shell.ExecuteArgs(nil, true, "helm", p[1:]...)
+// InstallChart installs the specified chart with its given name to the given namespace
+func (h *Helm) InstallChartWithValues(name, relpath, namespace string, values []string, timeout time.Duration) error {
+	p := filepath.Join(h.baseDir, relpath)
+
+	command := fmt.Sprintf("helm install %s %s --namespace %s --kubeconfig %s --timeout %s %s",
+		name, p, namespace, h.kubeConfig, timeout, strings.Join(values, " "))
+	return execCommand(command)
+}
+
+// InstallChart installs the specified chart with its given name to the given namespace
+func (h *Helm) InstallChart(name, relpath, namespace, overridesFile string, timeout time.Duration) error {
+	p := filepath.Join(h.baseDir, relpath)
+	command := fmt.Sprintf("helm install %s %s --namespace %s -f %s --kubeconfig %s --timeout %s",
+		name, p, namespace, overridesFile, h.kubeConfig, timeout)
+	return execCommand(command)
+}
+
+// UpgradeChart upgrades the specified chart with its given name to the given namespace; does not use baseWorkDir
+// but the full path passed
+func (h *Helm) UpgradeChart(name, chartPath, namespace, overridesFile string, timeout time.Duration) error {
+	command := fmt.Sprintf("helm upgrade %s %s --namespace %s -f %s --kubeconfig %s --timeout %s",
+		name, chartPath, namespace, overridesFile, h.kubeConfig, timeout)
+	return execCommand(command)
+}
+
+// DeleteChart deletes the specified chart with its given name in the given namespace
+func (h *Helm) DeleteChart(name, namespace string) error {
+	command := fmt.Sprintf("helm delete %s --namespace %s --kubeconfig %s", name, namespace, h.kubeConfig)
+	return execCommand(command)
+}
+
+func execCommand(cmd string) error {
+	scopes.Framework.Infof("Applying helm command: %s", cmd)
+
+	s, err := shell.Execute(true, cmd)
 	if err != nil {
-		scopes.Framework.Errorf("helm template: %v, out:%q", err, out)
+		scopes.Framework.Infof("(FAILED) Executing helm: %s (err: %v): %s", cmd, err, s)
+		return fmt.Errorf("%v: %s", err, s)
 	}
 
-	return out, err
+	return nil
 }

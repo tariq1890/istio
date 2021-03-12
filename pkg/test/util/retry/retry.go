@@ -1,4 +1,4 @@
-//  Copyright 2018 Istio Authors
+//  Copyright Istio Authors
 //
 //  Licensed under the Apache License, Version 2.0 (the "License");
 //  you may not use this file except in compliance with the License.
@@ -15,6 +15,7 @@
 package retry
 
 import (
+	"errors"
 	"fmt"
 	"time"
 
@@ -27,21 +28,25 @@ const (
 
 	// DefaultDelay the default delay between successive retry attempts
 	DefaultDelay = time.Millisecond * 10
+
+	// DefaultConverge the default converge, requiring something to succeed one time
+	DefaultConverge = 1
 )
 
-var (
-	defaultConfig = config{
-		timeout: DefaultTimeout,
-		delay:   DefaultDelay,
-	}
-)
-
-type config struct {
-	timeout time.Duration
-	delay   time.Duration
+var defaultConfig = config{
+	timeout:  DefaultTimeout,
+	delay:    DefaultDelay,
+	converge: DefaultConverge,
 }
 
-// Option for a retry opteration.
+type config struct {
+	error    string
+	timeout  time.Duration
+	delay    time.Duration
+	converge int
+}
+
+// Option for a retry operation.
 type Option func(cfg *config)
 
 // Timeout sets the timeout for the entire retry operation.
@@ -55,6 +60,22 @@ func Timeout(timeout time.Duration) Option {
 func Delay(delay time.Duration) Option {
 	return func(cfg *config) {
 		cfg.delay = delay
+	}
+}
+
+// Converge sets the number of successes in a row needed to count a success.
+// This is useful to avoid the case where tests like `coin.Flip() == HEADS` will always
+// return success due to random variance.
+func Converge(successes int) Option {
+	return func(cfg *config) {
+		cfg.converge = successes
+	}
+}
+
+// Message defines a more detailed error message to use when failing
+func Message(errorMessage string) Option {
+	return func(cfg *config) {
+		cfg.error = errorMessage
 	}
 }
 
@@ -84,6 +105,38 @@ func UntilSuccessOrFail(t test.Failer, fn func() error, options ...Option) {
 	}
 }
 
+var ErrConditionNotMet = errors.New("expected condition not met")
+
+// Until retries the given function until it returns true or hits the timeout timeout
+func Until(fn func() bool, options ...Option) error {
+	return UntilSuccess(func() error {
+		if !fn() {
+			return getErrorMessage(options)
+		}
+		return nil
+	}, options...)
+}
+
+// UntilOrFail calls Until, and fails t with Fatalf if it ends up returning an error
+func UntilOrFail(t test.Failer, fn func() bool, options ...Option) {
+	t.Helper()
+	err := Until(fn, options...)
+	if err != nil {
+		t.Fatalf("retry.UntilOrFail: %v", err)
+	}
+}
+
+func getErrorMessage(options []Option) error {
+	cfg := defaultConfig
+	for _, option := range options {
+		option(&cfg)
+	}
+	if cfg.error == "" {
+		return ErrConditionNotMet
+	}
+	return errors.New(cfg.error)
+}
+
 // Do retries the given function, until there is a timeout, or until the function indicates that it has completed.
 func Do(fn RetriableFunc, options ...Option) (interface{}, error) {
 	cfg := defaultConfig
@@ -91,23 +144,43 @@ func Do(fn RetriableFunc, options ...Option) (interface{}, error) {
 		option(&cfg)
 	}
 
+	successes := 0
+	attempts := 0
 	var lasterr error
 	to := time.After(cfg.timeout)
 	for {
 		select {
 		case <-to:
-			return nil, fmt.Errorf("timeout while waiting (last error: %v)", lasterr)
+			return nil, fmt.Errorf("timeout while waiting after %d attempts (last error: %v)", attempts, lasterr)
 		default:
 		}
 
 		result, completed, err := fn()
+		attempts++
 		if completed {
-			return result, err
+			if err == nil {
+				successes++
+			} else {
+				successes = 0
+			}
+			if successes >= cfg.converge {
+				return result, err
+			}
+
+			// Skip delay if we have a success
+			continue
+		} else {
+			successes = 0
 		}
 		if err != nil {
 			lasterr = err
 		}
 
-		<-time.After(cfg.delay)
+		select {
+		case <-to:
+			return nil, fmt.Errorf("timeout while waiting after %d attempts (last error: %v)", attempts, lasterr)
+		case <-time.After(cfg.delay):
+		}
+
 	}
 }

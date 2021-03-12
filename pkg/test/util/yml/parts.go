@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,18 +17,49 @@ package yml
 import (
 	"regexp"
 	"strings"
+
+	"github.com/ghodss/yaml"
+	kubeApiMeta "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 const (
 	joinSeparator = "\n---\n"
 )
 
-var (
-	// Split where the '---' appears at the very beginning of a line. This will avoid
-	// accidentally splitting in cases where yaml resources contain nested yaml (which
-	// is indented).
-	splitRegex = regexp.MustCompile(`(^|\n)---`)
-)
+// Split where the '---' appears at the very beginning of a line. This will avoid
+// accidentally splitting in cases where yaml resources contain nested yaml (which
+// is indented).
+var splitRegex = regexp.MustCompile(`(^|\n)---`)
+
+// SplitYamlByKind splits the given YAML into parts indexed by kind.
+func SplitYamlByKind(content string) map[string]string {
+	cfgs := SplitString(content)
+	result := map[string]string{}
+	for _, cfg := range cfgs {
+		var typeMeta kubeApiMeta.TypeMeta
+		if e := yaml.Unmarshal([]byte(cfg), &typeMeta); e != nil {
+			// Ignore invalid parts. This most commonly happens when it's empty or contains only comments.
+			continue
+		}
+		result[typeMeta.Kind] = JoinString(result[typeMeta.Kind], cfg)
+	}
+	return result
+}
+
+// SplitYamlByKind splits the given YAML into parts indexed by kind.
+func GetMetadata(content string) []kubeApiMeta.ObjectMeta {
+	cfgs := SplitString(content)
+	result := []kubeApiMeta.ObjectMeta{}
+	for _, cfg := range cfgs {
+		var m kubeApiMeta.ObjectMeta
+		if e := yaml.Unmarshal([]byte(cfg), &m); e != nil {
+			// Ignore invalid parts. This most commonly happens when it's empty or contains only comments.
+			continue
+		}
+		result = append(result, m)
+	}
+	return result
+}
 
 // SplitString splits the given yaml doc if it's multipart document.
 func SplitString(yamlText string) []string {

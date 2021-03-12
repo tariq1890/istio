@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,259 +15,404 @@
 package builder
 
 import (
-	"strings"
+	"io/ioutil"
 	"testing"
 
-	http_config "github.com/envoyproxy/go-control-plane/envoy/config/filter/http/rbac/v2"
-	tcp_config "github.com/envoyproxy/go-control-plane/envoy/config/filter/network/rbac/v2"
-	"github.com/envoyproxy/go-control-plane/pkg/util"
+	tcppb "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
+	httppb "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
+	"github.com/gogo/protobuf/proto"
 
-	istio_rbac "istio.io/api/rbac/v1alpha1"
+	meshconfig "istio.io/api/mesh/v1alpha1"
+	"istio.io/istio/pilot/pkg/config/kube/crd"
+	"istio.io/istio/pilot/pkg/config/memory"
 	"istio.io/istio/pilot/pkg/model"
-	authz_model "istio.io/istio/pilot/pkg/security/authz/model"
-	"istio.io/istio/pilot/pkg/security/authz/policy"
+	"istio.io/istio/pilot/pkg/networking/plugin"
+	"istio.io/istio/pilot/pkg/security/trustdomain"
+	"istio.io/istio/pilot/test/util"
 	"istio.io/istio/pkg/config"
+	"istio.io/istio/pkg/config/host"
+	"istio.io/istio/pkg/config/schema/collections"
+	"istio.io/istio/pkg/util/protomarshal"
 )
 
-func newAuthzPolicyWithRbacConfig(mode istio_rbac.RbacConfig_Mode, include *istio_rbac.RbacConfig_Target,
-	exclude *istio_rbac.RbacConfig_Target) *model.AuthorizationPolicies {
-	return &model.AuthorizationPolicies{
-		RbacConfig: &istio_rbac.RbacConfig{
-			Mode:      mode,
-			Inclusion: include,
-			Exclusion: exclude,
+const (
+	basePath = "testdata/"
+)
+
+var (
+	httpbin = map[string]string{
+		"app":     "httpbin",
+		"version": "v1",
+	}
+	meshConfigGRPCNoNamespace = &meshconfig.MeshConfig{
+		ExtensionProviders: []*meshconfig.MeshConfig_ExtensionProvider{
+			{
+				Name: "default",
+				Provider: &meshconfig.MeshConfig_ExtensionProvider_EnvoyExtAuthzGrpc{
+					EnvoyExtAuthzGrpc: &meshconfig.MeshConfig_ExtensionProvider_EnvoyExternalAuthorizationGrpcProvider{
+						Service:       "my-custom-ext-authz.foo.svc.cluster.local",
+						Port:          9000,
+						FailOpen:      true,
+						StatusOnError: "403",
+					},
+				},
+			},
 		},
+	}
+	meshConfigGRPC = &meshconfig.MeshConfig{
+		ExtensionProviders: []*meshconfig.MeshConfig_ExtensionProvider{
+			{
+				Name: "default",
+				Provider: &meshconfig.MeshConfig_ExtensionProvider_EnvoyExtAuthzGrpc{
+					EnvoyExtAuthzGrpc: &meshconfig.MeshConfig_ExtensionProvider_EnvoyExternalAuthorizationGrpcProvider{
+						Service:       "foo/my-custom-ext-authz.foo.svc.cluster.local",
+						Port:          9000,
+						FailOpen:      true,
+						StatusOnError: "403",
+					},
+				},
+			},
+		},
+	}
+	meshConfigHTTP = &meshconfig.MeshConfig{
+		ExtensionProviders: []*meshconfig.MeshConfig_ExtensionProvider{
+			{
+				Name: "default",
+				Provider: &meshconfig.MeshConfig_ExtensionProvider_EnvoyExtAuthzHttp{
+					EnvoyExtAuthzHttp: &meshconfig.MeshConfig_ExtensionProvider_EnvoyExternalAuthorizationHttpProvider{
+						Service:                   "foo/my-custom-ext-authz.foo.svc.cluster.local",
+						Port:                      9000,
+						FailOpen:                  true,
+						StatusOnError:             "403",
+						PathPrefix:                "/check",
+						IncludeHeadersInCheck:     []string{"x-custom-id"},
+						HeadersToUpstreamOnAllow:  []string{"Authorization"},
+						HeadersToDownstreamOnDeny: []string{"Set-cookie"},
+					},
+				},
+			},
+		},
+	}
+	meshConfigInvalid = &meshconfig.MeshConfig{
+		ExtensionProviders: []*meshconfig.MeshConfig_ExtensionProvider{
+			{
+				Name: "default",
+				Provider: &meshconfig.MeshConfig_ExtensionProvider_EnvoyExtAuthzHttp{
+					EnvoyExtAuthzHttp: &meshconfig.MeshConfig_ExtensionProvider_EnvoyExternalAuthorizationHttpProvider{
+						Service:       "foo/my-custom-ext-authz",
+						Port:          999999,
+						PathPrefix:    "check",
+						StatusOnError: "999",
+					},
+				},
+			},
+		},
+	}
+)
+
+func TestGenerator_GenerateHTTP(t *testing.T) {
+	testCases := []struct {
+		name       string
+		tdBundle   trustdomain.Bundle
+		meshConfig *meshconfig.MeshConfig
+		input      string
+		want       []string
+	}{
+		{
+			name:  "path",
+			input: "path-in.yaml",
+			want:  []string{"path-out.yaml"},
+		},
+		{
+			name:       "action-custom-grpc-provider-no-namespace",
+			meshConfig: meshConfigGRPCNoNamespace,
+			input:      "action-custom-in.yaml",
+			want:       []string{"action-custom-grpc-provider-out1.yaml", "action-custom-grpc-provider-out2.yaml"},
+		},
+		{
+			name:       "action-custom-grpc-provider",
+			meshConfig: meshConfigGRPC,
+			input:      "action-custom-in.yaml",
+			want:       []string{"action-custom-grpc-provider-out1.yaml", "action-custom-grpc-provider-out2.yaml"},
+		},
+		{
+			name:       "action-custom-http-provider",
+			meshConfig: meshConfigHTTP,
+			input:      "action-custom-in.yaml",
+			want:       []string{"action-custom-http-provider-out1.yaml", "action-custom-http-provider-out2.yaml"},
+		},
+		{
+			name:       "action-custom-bad-multiple-providers",
+			meshConfig: meshConfigHTTP,
+			input:      "action-custom-bad-multiple-providers-in.yaml",
+			want:       []string{"action-custom-bad-out.yaml"},
+		},
+		{
+			name:       "action-custom-bad-invalid-config",
+			meshConfig: meshConfigInvalid,
+			input:      "action-custom-in.yaml",
+			want:       []string{"action-custom-bad-out.yaml"},
+		},
+		{
+			name:  "action-both",
+			input: "action-both-in.yaml",
+			want: []string{
+				"action-both-deny-out.yaml",
+				"action-both-allow-out.yaml",
+			},
+		},
+		{
+			name:  "all-fields",
+			input: "all-fields-in.yaml",
+			want:  []string{"all-fields-out.yaml"},
+		},
+		{
+			name:  "allow-all",
+			input: "allow-all-in.yaml",
+			want:  []string{"allow-all-out.yaml"},
+		},
+		{
+			name:  "allow-none",
+			input: "allow-none-in.yaml",
+			want:  []string{"allow-none-out.yaml"},
+		},
+		{
+			name:  "deny-all",
+			input: "deny-all-in.yaml",
+			want:  []string{"deny-all-out.yaml"},
+		},
+		{
+			name:  "multiple-policies",
+			input: "multiple-policies-in.yaml",
+			want:  []string{"multiple-policies-out.yaml"},
+		},
+		{
+			name:  "single-policy",
+			input: "single-policy-in.yaml",
+			want:  []string{"single-policy-out.yaml"},
+		},
+		{
+			name:     "trust-domain-one-alias",
+			tdBundle: trustdomain.NewBundle("td1", []string{"cluster.local"}),
+			input:    "simple-policy-td-aliases-in.yaml",
+			want:     []string{"simple-policy-td-aliases-out.yaml"},
+		},
+		{
+			name:     "trust-domain-multiple-aliases",
+			tdBundle: trustdomain.NewBundle("td1", []string{"cluster.local", "some-td"}),
+			input:    "simple-policy-multiple-td-aliases-in.yaml",
+			want:     []string{"simple-policy-multiple-td-aliases-out.yaml"},
+		},
+		{
+			name:     "trust-domain-wildcard-in-principal",
+			tdBundle: trustdomain.NewBundle("td1", []string{"foobar"}),
+			input:    "simple-policy-principal-with-wildcard-in.yaml",
+			want:     []string{"simple-policy-principal-with-wildcard-out.yaml"},
+		},
+		{
+			name:     "trust-domain-aliases-in-source-principal",
+			tdBundle: trustdomain.NewBundle("new-td", []string{"old-td", "some-trustdomain"}),
+			input:    "td-aliases-source-principal-in.yaml",
+			want:     []string{"td-aliases-source-principal-out.yaml"},
+		},
+		{
+			name:  "audit-all",
+			input: "audit-all-in.yaml",
+			want:  []string{"audit-all-out.yaml"},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			option := Option{
+				IsCustomBuilder: tc.meshConfig != nil,
+				Logger:          &AuthzLogger{},
+			}
+			in := inputParams(t, tc.input, tc.meshConfig)
+			defer option.Logger.Report(in)
+			g := New(tc.tdBundle, in, option)
+			if g == nil {
+				t.Fatalf("failed to create generator")
+			}
+			got := g.BuildHTTP()
+			verify(t, convertHTTP(got), tc.want, false /* forTCP */)
+		})
 	}
 }
 
-func newService(hostname string, labels map[string]string, t *testing.T) *model.ServiceInstance {
+func TestGenerator_GenerateTCP(t *testing.T) {
+	testCases := []struct {
+		name       string
+		tdBundle   trustdomain.Bundle
+		meshConfig *meshconfig.MeshConfig
+		input      string
+		want       []string
+	}{
+		{
+			name:       "action-custom-http-provider",
+			meshConfig: meshConfigHTTP,
+			input:      "action-custom-in.yaml",
+			want:       []string{},
+		},
+		{
+			name:       "action-custom-HTTP-for-TCP-filter",
+			meshConfig: meshConfigGRPC,
+			input:      "action-custom-HTTP-for-TCP-filter-in.yaml",
+			want:       []string{"action-custom-HTTP-for-TCP-filter-out1.yaml", "action-custom-HTTP-for-TCP-filter-out2.yaml"},
+		},
+		{
+			name:  "action-allow-HTTP-for-TCP-filter",
+			input: "action-allow-HTTP-for-TCP-filter-in.yaml",
+			want:  []string{"action-allow-HTTP-for-TCP-filter-out.yaml"},
+		},
+		{
+			name:  "action-deny-HTTP-for-TCP-filter",
+			input: "action-deny-HTTP-for-TCP-filter-in.yaml",
+			want:  []string{"action-deny-HTTP-for-TCP-filter-out.yaml"},
+		},
+		{
+			name:  "action-audit-HTTP-for-TCP-filter",
+			input: "action-audit-HTTP-for-TCP-filter-in.yaml",
+			want:  []string{"action-audit-HTTP-for-TCP-filter-out.yaml"},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			option := Option{
+				IsCustomBuilder: tc.meshConfig != nil,
+				Logger:          &AuthzLogger{},
+			}
+			in := inputParams(t, tc.input, tc.meshConfig)
+			defer option.Logger.Report(in)
+			g := New(tc.tdBundle, in, option)
+			if g == nil {
+				t.Fatalf("failed to create generator")
+			}
+			got := g.BuildTCP()
+			verify(t, convertTCP(got), tc.want, true /* forTCP */)
+		})
+	}
+}
+
+func verify(t *testing.T, gots []proto.Message, wants []string, forTCP bool) {
 	t.Helper()
-	splits := strings.Split(hostname, ".")
-	if len(splits) < 2 {
-		t.Fatalf("failed to initialize service instance: invalid hostname")
-	}
-	name := splits[0]
-	namespace := splits[1]
-	return &model.ServiceInstance{
-		Service: &model.Service{
-			Attributes: model.ServiceAttributes{
-				Name:      name,
-				Namespace: namespace,
-			},
-			Hostname: config.Hostname(hostname),
-		},
-		Labels: labels,
-	}
-}
 
-func simpleGlobalPermissiveMode() *model.Config {
-	cfg := &model.Config{
-		ConfigMeta: model.ConfigMeta{
-			Type:      model.ClusterRbacConfig.Type,
-			Name:      "default",
-			Namespace: "default",
-		},
-		Spec: &istio_rbac.RbacConfig{
-			Mode:            istio_rbac.RbacConfig_ON,
-			EnforcementMode: istio_rbac.EnforcementMode_PERMISSIVE,
-		},
+	if len(gots) != len(wants) {
+		t.Fatalf("got %d configs but want %d", len(gots), len(wants))
 	}
-	return cfg
-}
+	for i, got := range gots {
+		gotYaml, err := protomarshal.ToYAML(got)
+		if err != nil {
+			t.Fatalf("failed to convert to YAML: %v", err)
+		}
 
-func TestIsRbacEnabled(t *testing.T) {
-	target := &istio_rbac.RbacConfig_Target{
-		Services:   []string{"review.default.svc", "product.default.svc"},
-		Namespaces: []string{"special"},
-	}
-	cfg1 := newAuthzPolicyWithRbacConfig(istio_rbac.RbacConfig_ON, nil, nil)
-	cfg2 := newAuthzPolicyWithRbacConfig(istio_rbac.RbacConfig_OFF, nil, nil)
-	cfg3 := newAuthzPolicyWithRbacConfig(istio_rbac.RbacConfig_ON_WITH_INCLUSION, target, nil)
-	cfg4 := newAuthzPolicyWithRbacConfig(istio_rbac.RbacConfig_ON_WITH_EXCLUSION, nil, target)
-	cfg5 := newAuthzPolicyWithRbacConfig(istio_rbac.RbacConfig_ON, nil, nil)
+		wantFile := basePath + wants[i]
+		want := yamlConfig(t, wantFile, forTCP)
+		wantYaml, err := protomarshal.ToYAML(want)
+		if err != nil {
+			t.Fatalf("failed to convert to YAML: %v", err)
+		}
 
-	testCases := []struct {
-		Name          string
-		AuthzPolicies *model.AuthorizationPolicies
-		Service       string
-		Namespace     string
-		want          bool
-	}{
-		{
-			Name:          "rbac plugin enabled",
-			AuthzPolicies: cfg1,
-			want:          true,
-		},
-		{
-			Name:          "rbac plugin disabled",
-			AuthzPolicies: cfg2,
-		},
-		{
-			Name:          "rbac plugin enabled by inclusion.service",
-			AuthzPolicies: cfg3,
-			Service:       "product.default.svc",
-			Namespace:     "default",
-			want:          true,
-		},
-		{
-			Name:          "rbac plugin enabled by inclusion.namespace",
-			AuthzPolicies: cfg3,
-			Service:       "other.special.svc",
-			Namespace:     "special",
-			want:          true,
-		},
-		{
-			Name:          "rbac plugin disabled by exclusion.service",
-			AuthzPolicies: cfg4,
-			Service:       "product.default.svc",
-			Namespace:     "default",
-		},
-		{
-			Name:          "rbac plugin disabled by exclusion.namespace",
-			AuthzPolicies: cfg4,
-			Service:       "other.special.svc",
-			Namespace:     "special",
-		},
-		{
-			Name:          "rbac plugin enabled with permissive",
-			AuthzPolicies: cfg5,
-			want:          true,
-		},
-	}
-
-	for _, tc := range testCases {
-		got := isRbacEnabled(tc.Service, tc.Namespace, tc.AuthzPolicies)
-		if tc.want != got {
-			t.Errorf("%s: expecting %v but got %v", tc.Name, tc.want, got)
+		util.RefreshGoldenFile([]byte(gotYaml), wantFile, t)
+		if err := util.Compare([]byte(gotYaml), []byte(wantYaml)); err != nil {
+			t.Error(err)
 		}
 	}
 }
 
-func TestBuilder_BuildHTTPFilter(t *testing.T) {
-	service := newService("bar.a.svc.cluster.local", nil, t)
-
-	testCases := []struct {
-		name                        string
-		policies                    []*model.Config
-		isXDSMarshalingToAnyEnabled bool
-		wantRuleWithPolicies        bool
-	}{
-		{
-			name:                        "XDSMarshalingToAnyEnabled",
-			isXDSMarshalingToAnyEnabled: true,
-		},
-		{
-			name: "HTTP rule",
-			policies: []*model.Config{
-				policy.SimpleRole("role-1", "a", "bar"),
-				policy.SimpleBinding("binding-1", "a", "role-1"),
-			},
-			wantRuleWithPolicies: true,
-		},
+func yamlPolicy(t *testing.T, filename string) *model.AuthorizationPolicies {
+	t.Helper()
+	data, err := ioutil.ReadFile(filename)
+	if err != nil {
+		t.Fatalf("failed to read input yaml file: %v", err)
+	}
+	c, _, err := crd.ParseInputs(string(data))
+	if err != nil {
+		t.Fatalf("failde to parse CRD: %v", err)
+	}
+	var configs []*config.Config
+	for i := range c {
+		configs = append(configs, &c[i])
 	}
 
-	for _, tc := range testCases {
-		p := policy.NewAuthzPolicies(tc.policies, t)
-		b := NewBuilder(service, p, tc.isXDSMarshalingToAnyEnabled)
-
-		got := b.BuildHTTPFilter()
-		if got.Name != authz_model.RBACHTTPFilterName {
-			t.Errorf("%s: got filter name %q but want %q", tc.name, got.Name, authz_model.RBACHTTPFilterName)
-		}
-
-		if tc.isXDSMarshalingToAnyEnabled {
-			if got.GetTypedConfig() == nil {
-				t.Errorf("%s: want typed config when isXDSMarshalingToAnyEnabled is true", tc.name)
-			}
-		} else {
-			rbacConfig := &http_config.RBAC{}
-			if got.GetConfig() == nil {
-				t.Errorf("%s: want struct config when isXDSMarshalingToAnyEnabled is false", tc.name)
-			} else if err := util.StructToMessage(got.GetConfig(), rbacConfig); err != nil {
-				t.Errorf("%s: failed to convert struct to message: %s", tc.name, err)
-			} else if len(rbacConfig.GetRules().GetPolicies()) > 0 != tc.wantRuleWithPolicies {
-				t.Errorf("%s: got rules with policies %v but want %v",
-					tc.name, len(rbacConfig.GetRules().GetPolicies()) > 0, tc.wantRuleWithPolicies)
-			}
-		}
-	}
+	return newAuthzPolicies(t, configs)
 }
 
-func TestBuilder_BuildTCPFilter(t *testing.T) {
-	service := newService("foo.a.svc.cluster.local", nil, t)
-
-	testCases := []struct {
-		name                        string
-		policies                    []*model.Config
-		isXDSMarshalingToAnyEnabled bool
-		wantRules                   bool
-		wantRuleWithPolicies        bool
-		wantShadowRules             bool
-	}{
-		{
-			name:                        "XDSMarshalingToAnyEnabled",
-			isXDSMarshalingToAnyEnabled: true,
-		},
-		{
-			name: "HTTP rule",
-			policies: []*model.Config{
-				policy.SimpleRole("role-1", "a", "foo"),
-				policy.SimpleBinding("binding-1", "a", "role-1"),
-			},
-			wantRules:            true,
-			wantRuleWithPolicies: false,
-		},
-		{
-			name:      "normal rule",
-			wantRules: true,
-		},
-		{
-			name: "normal shadow rule",
-			policies: []*model.Config{
-				simpleGlobalPermissiveMode(),
-			},
-			wantShadowRules: true,
-		},
+func yamlConfig(t *testing.T, filename string, forTCP bool) proto.Message {
+	t.Helper()
+	data, err := ioutil.ReadFile(filename)
+	if err != nil {
+		t.Fatalf("failed to read file: %v", err)
 	}
-
-	for _, tc := range testCases {
-		p := policy.NewAuthzPolicies(tc.policies, t)
-		b := NewBuilder(service, p, tc.isXDSMarshalingToAnyEnabled)
-
-		got := b.BuildTCPFilter()
-		if got.Name != authz_model.RBACTCPFilterName {
-			t.Errorf("%s: got filter name %q but want %q", tc.name, got.Name, authz_model.RBACTCPFilterName)
+	if forTCP {
+		out := &tcppb.Filter{}
+		if err := protomarshal.ApplyYAML(string(data), out); err != nil {
+			t.Fatalf("failed to parse YAML: %v", err)
 		}
+		return out
+	}
+	out := &httppb.HttpFilter{}
+	if err := protomarshal.ApplyYAML(string(data), out); err != nil {
+		t.Fatalf("failed to parse YAML: %v", err)
+	}
+	return out
+}
 
-		if tc.isXDSMarshalingToAnyEnabled {
-			if got.GetTypedConfig() == nil {
-				t.Errorf("%s: want typed config when isXDSMarshalingToAnyEnabled is true", tc.name)
-			}
-		} else {
-			rbacConfig := &tcp_config.RBAC{}
-			if got.GetConfig() == nil {
-				t.Errorf("%s: want struct config when isXDSMarshalingToAnyEnabled is false", tc.name)
-			} else if err := util.StructToMessage(got.GetConfig(), rbacConfig); err != nil {
-				t.Errorf("%s: failed to convert struct to message: %s", tc.name, err)
-			} else {
-				if rbacConfig.StatPrefix != authz_model.RBACTCPFilterStatPrefix {
-					t.Errorf("%s: got filter stat prefix %q but want %q",
-						tc.name, rbacConfig.StatPrefix, authz_model.RBACTCPFilterStatPrefix)
-				}
+func convertHTTP(in []*httppb.HttpFilter) []proto.Message {
+	ret := make([]proto.Message, len(in))
+	for i := range in {
+		ret[i] = in[i]
+	}
+	return ret
+}
 
-				if len(rbacConfig.GetRules().GetPolicies()) > 0 != tc.wantRuleWithPolicies {
-					t.Errorf("%s: got rules with policies %v but want %v",
-						tc.name, len(rbacConfig.GetRules().GetPolicies()) > 0, tc.wantRuleWithPolicies)
-				}
-				if (rbacConfig.GetRules().GetPolicies() != nil) != tc.wantRules {
-					t.Errorf("%s: got rules %v but want %v",
-						tc.name, rbacConfig.GetRules().GetPolicies() != nil, tc.wantRules)
-				}
-				if (rbacConfig.GetShadowRules().GetPolicies() != nil) != tc.wantShadowRules {
-					t.Errorf("%s: got shadow rules %v but want %v",
-						tc.name, rbacConfig.GetShadowRules().GetPolicies() != nil, tc.wantShadowRules)
-				}
-			}
+func convertTCP(in []*tcppb.Filter) []proto.Message {
+	ret := make([]proto.Message, len(in))
+	for i := range in {
+		ret[i] = in[i]
+	}
+	return ret
+}
+
+func newAuthzPolicies(t *testing.T, policies []*config.Config) *model.AuthorizationPolicies {
+	store := model.MakeIstioStore(memory.Make(collections.Pilot))
+	for _, p := range policies {
+		if _, err := store.Create(*p); err != nil {
+			t.Fatalf("newAuthzPolicies: %v", err)
 		}
 	}
+
+	authzPolicies, err := model.GetAuthorizationPolicies(&model.Environment{
+		IstioConfigStore: store,
+	})
+	if err != nil {
+		t.Fatalf("newAuthzPolicies: %v", err)
+	}
+	return authzPolicies
+}
+
+func inputParams(t *testing.T, input string, mc *meshconfig.MeshConfig) *plugin.InputParams {
+	t.Helper()
+	ret := &plugin.InputParams{
+		Node: &model.Proxy{
+			ID:              "test-node",
+			ConfigNamespace: "foo",
+			Metadata: &model.NodeMetadata{
+				Labels: httpbin,
+			},
+		},
+		Push: &model.PushContext{
+			AuthzPolicies: yamlPolicy(t, basePath+input),
+			Mesh:          mc,
+		},
+	}
+	ret.Push.ServiceIndex.HostnameAndNamespace = map[host.Name]map[string]*model.Service{
+		"my-custom-ext-authz.foo.svc.cluster.local": {
+			"foo": &model.Service{
+				Hostname: "my-custom-ext-authz.foo.svc.cluster.local",
+			},
+		},
+	}
+	return ret
 }

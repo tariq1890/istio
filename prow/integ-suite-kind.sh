@@ -29,19 +29,22 @@ set -u
 # Print commands
 set -x
 
+
 # shellcheck source=prow/lib.sh
 source "${ROOT}/prow/lib.sh"
 setup_and_export_git_sha
 
-function build_kind_images() {
-  # Build just the images needed for the tests
-  for image in pilot proxyv2 proxy_init app test_policybackend mixer citadel galley sidecar_injector kubectl node-agent-k8s; do
-     make docker.${image}
-  done
-	# Archived local images and load it into KinD's docker daemon
-	# Kubernetes in KinD can only access local images from its docker daemon.
-	docker images "${HUB}/*:${TAG}" --format '{{.Repository}}:{{.Tag}}' | xargs -n1 -P16 kind --loglevel debug --name istio-testing load docker-image
-}
+# shellcheck source=common/scripts/kind_provisioner.sh
+source "${ROOT}/common/scripts/kind_provisioner.sh"
+
+TOPOLOGY=SINGLE_CLUSTER
+# We are currently running from head of release-1.20, until a release containing the fix in b86925b0fbd
+# is built.
+NODE_IMAGE="gcr.io/istio-testing/kind-node:b86925b0fbd"
+KIND_CONFIG=""
+CLUSTER_TOPOLOGY_CONFIG_FILE="${ROOT}/prow/config/topology/multicluster.json"
+
+PARAMS=()
 
 while (( "$#" )); do
   case "$1" in
@@ -51,13 +54,44 @@ while (( "$#" )); do
       NODE_IMAGE=$2
       shift 2
     ;;
+    # Config for enabling different Kubernetes features in KinD (see prow/config{endpointslice.yaml,trustworthy-jwt.yaml}).
+    --kind-config)
+    KIND_CONFIG=$2
+    shift 2
+    ;;
     --skip-setup)
       SKIP_SETUP=true
+      shift
+    ;;
+    --skip-cleanup)
+      SKIP_CLEANUP=true
       shift
     ;;
     --skip-build)
       SKIP_BUILD=true
       shift
+    ;;
+    --manual)
+      MANUAL=true
+      shift
+    ;;
+    --topology)
+      case $2 in
+        # TODO(landow) get rid of MULTICLUSTER_SINGLE_NETWORK after updating Prow job
+        SINGLE_CLUSTER | MULTICLUSTER_SINGLE_NETWORK | MULTICLUSTER )
+          TOPOLOGY=$2
+          echo "Running with topology ${TOPOLOGY}"
+          ;;
+        *)
+          echo "Error: Unsupported topology ${TOPOLOGY}" >&2
+          exit 1
+          ;;
+      esac
+      shift 2
+    ;;
+    --topology-config)
+      CLUSTER_TOPOLOGY_CONFIG_FILE="${ROOT}/${2}"
+      shift 2
     ;;
     -*)
       echo "Error: Unsupported flag $1" >&2
@@ -70,29 +104,86 @@ while (( "$#" )); do
   esac
 done
 
+# Default IP family of the cluster is IPv4
+export IP_FAMILY="${IP_FAMILY:-ipv4}"
 
 # KinD will not have a LoadBalancer, so we need to disable it
 export TEST_ENV=kind
+# LoadBalancer in Kind is supported using metallb if not ipv6.
+if [ "${IP_FAMILY}" != "ipv6" ]; then
+  export TEST_ENV=kind-metallb
+fi
 
-# KinD will have the images loaded into it; it should not attempt to pull them
 # See https://kind.sigs.k8s.io/docs/user/quick-start/#loading-an-image-into-your-cluster
 export PULL_POLICY=IfNotPresent
+
+# We run a local-registry in a docker container that KinD nodes pull from
+# These values are must match what is in config/trustworthy-jwt.yaml
+export KIND_REGISTRY_NAME="kind-registry"
+export KIND_REGISTRY_PORT="5000"
+export KIND_REGISTRY="localhost:${KIND_REGISTRY_PORT}"
 
 export HUB=${HUB:-"istio-testing"}
 export TAG="${TAG:-"istio-testing"}"
 
-# Setup junit report and verbose logging
-export JUNIT_UNIT_TEST_XML="${ARTIFACTS:-$(mktemp -d)}/junit.xml"
-export T="${T:-"-v"}"
+# If we're not intending to pull from an actual remote registry, use the local kind registry
+if [[ -z "${SKIP_BUILD:-}" ]]; then
+  HUB="${KIND_REGISTRY}"
+  export HUB
+fi
 
-make init
+# Setup junit report and verbose logging
+export T="${T:-"-v -count=1"}"
+export CI="true"
+
+export ARTIFACTS="${ARTIFACTS:-$(mktemp -d)}"
+trace "init" make init
 
 if [[ -z "${SKIP_SETUP:-}" ]]; then
-  time setup_kind_cluster "${NODE_IMAGE:-}"
+  export DEFAULT_CLUSTER_YAML="./prow/config/trustworthy-jwt.yaml"
+  export METRICS_SERVER_CONFIG_DIR='./prow/config/metrics'
+
+  if [[ "${TOPOLOGY}" == "SINGLE_CLUSTER" ]]; then
+    trace "setup kind cluster" setup_kind_cluster "istio-testing" "${NODE_IMAGE}" "${KIND_CONFIG}"
+  else
+    trace "load cluster topology" load_cluster_topology "${CLUSTER_TOPOLOGY_CONFIG_FILE}"
+    trace "setup kind clusters" setup_kind_clusters "${NODE_IMAGE}" "${IP_FAMILY}"
+
+    TOPOLOGY_JSON=$(cat "${CLUSTER_TOPOLOGY_CONFIG_FILE}")
+    for i in $(seq 0 $((${#CLUSTER_NAMES[@]} - 1))); do
+      CLUSTER="${CLUSTER_NAMES[i]}"
+      KCONFIG="${KUBECONFIGS[i]}"
+      TOPOLOGY_JSON=$(set_topology_value "${TOPOLOGY_JSON}" "${CLUSTER}" "meta.kubeconfig" "${KCONFIG}")
+    done
+    RUNTIME_TOPOLOGY_CONFIG_FILE="${ARTIFACTS}/topology-config.json"
+    echo "${TOPOLOGY_JSON}" > "${RUNTIME_TOPOLOGY_CONFIG_FILE}"
+
+    export INTEGRATION_TEST_TOPOLOGY_FILE
+    INTEGRATION_TEST_TOPOLOGY_FILE="${RUNTIME_TOPOLOGY_CONFIG_FILE}"
+
+    export INTEGRATION_TEST_KUBECONFIG
+    INTEGRATION_TEST_KUBECONFIG=NONE
+  fi
 fi
 
 if [[ -z "${SKIP_BUILD:-}" ]]; then
-  time build_kind_images
+  trace "setup kind registry" setup_kind_registry
+  trace "build images" build_images "${PARAMS[*]}"
 fi
 
-make "${PARAMS[*]}"
+# If a variant is defined, update the tag accordingly
+if [[ -n "${VARIANT:-}" ]]; then
+  export TAG="${TAG}-${VARIANT}"
+fi
+
+# Run the test target if provided.
+if [[ -n "${PARAMS:-}" ]]; then
+  trace "test" make "${PARAMS[*]}"
+fi
+
+# Check if the user is running the clusters in manual mode.
+if [[ -n "${MANUAL:-}" ]]; then
+  echo "Running cluster(s) in manual mode. Press any key to shutdown and exit..."
+  read -rsn1
+  exit 0
+fi

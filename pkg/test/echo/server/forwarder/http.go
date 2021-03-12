@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,7 +20,11 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net/http"
+	"sort"
 	"strings"
+
+	"github.com/lucas-clemente/quic-go/http3"
+	"golang.org/x/net/http2"
 
 	"istio.io/istio/pkg/test/echo/common"
 	"istio.io/istio/pkg/test/echo/common/response"
@@ -39,13 +43,32 @@ func (c *httpProtocol) setHost(r *http.Request, host string) {
 	if r.URL.Scheme == "https" {
 		// Set SNI value to be same as the request Host
 		// For use with SNI routing tests
-		httpTransport := c.client.Transport.(*http.Transport)
-		httpTransport.TLSClientConfig.ServerName = host
+		httpTransport, ok := c.client.Transport.(*http.Transport)
+		if ok {
+			httpTransport.TLSClientConfig.ServerName = host
+			return
+		}
+
+		http2Transport, ok := c.client.Transport.(*http2.Transport)
+		if ok {
+			http2Transport.TLSClientConfig.ServerName = host
+			return
+		}
+
+		http3Transport, ok := c.client.Transport.(*http3.RoundTripper)
+		if ok {
+			http3Transport.TLSClientConfig.ServerName = host
+			return
+		}
 	}
 }
 
 func (c *httpProtocol) makeRequest(ctx context.Context, req *request) (string, error) {
-	httpReq, err := http.NewRequest("GET", req.URL, nil)
+	method := req.Method
+	if method == "" {
+		method = "GET"
+	}
+	httpReq, err := http.NewRequest(method, req.URL, nil)
 	if err != nil {
 		return "", err
 	}
@@ -75,7 +98,13 @@ func (c *httpProtocol) makeRequest(ctx context.Context, req *request) (string, e
 
 	outBuffer.WriteString(fmt.Sprintf("[%d] %s=%d\n", req.RequestID, response.StatusCodeField, httpResp.StatusCode))
 
-	for key, values := range httpResp.Header {
+	keys := []string{}
+	for k := range httpResp.Header {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		values := httpResp.Header[key]
 		for _, value := range values {
 			outBuffer.WriteString(fmt.Sprintf("[%d] ResponseHeader=%s:%s\n", req.RequestID, key, value))
 		}
@@ -102,5 +131,6 @@ func (c *httpProtocol) makeRequest(ctx context.Context, req *request) (string, e
 }
 
 func (c *httpProtocol) Close() error {
+	c.client.CloseIdleConnections()
 	return nil
 }
