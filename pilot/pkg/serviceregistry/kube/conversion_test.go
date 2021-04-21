@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,15 +21,13 @@ import (
 	"testing"
 	"time"
 
-	"istio.io/api/annotation"
-	"istio.io/istio/pilot/pkg/model"
-	"istio.io/istio/pkg/config"
-	"istio.io/istio/pkg/config/kube"
-	"istio.io/istio/pkg/spiffe"
-
 	coreV1 "k8s.io/api/core/v1"
 	metaV1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/intstr"
+
+	"istio.io/api/annotation"
+	"istio.io/istio/pkg/config/kube"
+	"istio.io/istio/pkg/config/protocol"
+	"istio.io/istio/pkg/spiffe"
 )
 
 var (
@@ -38,31 +36,43 @@ var (
 )
 
 func TestConvertProtocol(t *testing.T) {
+	http := "http"
 	type protocolCase struct {
-		name  string
-		proto coreV1.Protocol
-		out   config.Protocol
+		port        int32
+		name        string
+		appProtocol *string
+		proto       coreV1.Protocol
+		out         protocol.Instance
 	}
 	protocols := []protocolCase{
-		{"", coreV1.ProtocolTCP, config.ProtocolTCP},
-		{"http", coreV1.ProtocolTCP, config.ProtocolHTTP},
-		{"http-test", coreV1.ProtocolTCP, config.ProtocolHTTP},
-		{"http", coreV1.ProtocolUDP, config.ProtocolUDP},
-		{"httptest", coreV1.ProtocolTCP, config.ProtocolTCP},
-		{"https", coreV1.ProtocolTCP, config.ProtocolHTTPS},
-		{"https-test", coreV1.ProtocolTCP, config.ProtocolHTTPS},
-		{"http2", coreV1.ProtocolTCP, config.ProtocolHTTP2},
-		{"http2-test", coreV1.ProtocolTCP, config.ProtocolHTTP2},
-		{"grpc", coreV1.ProtocolTCP, config.ProtocolGRPC},
-		{"grpc-test", coreV1.ProtocolTCP, config.ProtocolGRPC},
-		{"grpc-web", coreV1.ProtocolTCP, config.ProtocolGRPCWeb},
-		{"grpc-web-test", coreV1.ProtocolTCP, config.ProtocolGRPCWeb},
-		{"mongo", coreV1.ProtocolTCP, config.ProtocolMongo},
-		{"mongo-test", coreV1.ProtocolTCP, config.ProtocolMongo},
-		{"redis", coreV1.ProtocolTCP, config.ProtocolRedis},
-		{"redis-test", coreV1.ProtocolTCP, config.ProtocolRedis},
-		{"mysql", coreV1.ProtocolTCP, config.ProtocolMySQL},
-		{"mysql-test", coreV1.ProtocolTCP, config.ProtocolMySQL},
+		{8888, "", nil, coreV1.ProtocolTCP, protocol.Unsupported},
+		{25, "", nil, coreV1.ProtocolTCP, protocol.TCP},
+		{53, "", nil, coreV1.ProtocolTCP, protocol.TCP},
+		{3306, "", nil, coreV1.ProtocolTCP, protocol.TCP},
+		{27017, "", nil, coreV1.ProtocolTCP, protocol.TCP},
+		{8888, "http", nil, coreV1.ProtocolTCP, protocol.HTTP},
+		{8888, "http-test", nil, coreV1.ProtocolTCP, protocol.HTTP},
+		{8888, "http", nil, coreV1.ProtocolUDP, protocol.UDP},
+		{8888, "httptest", nil, coreV1.ProtocolTCP, protocol.Unsupported},
+		{25, "httptest", nil, coreV1.ProtocolTCP, protocol.TCP},
+		{53, "httptest", nil, coreV1.ProtocolTCP, protocol.TCP},
+		{3306, "httptest", nil, coreV1.ProtocolTCP, protocol.TCP},
+		{27017, "httptest", nil, coreV1.ProtocolTCP, protocol.TCP},
+		{8888, "https", nil, coreV1.ProtocolTCP, protocol.HTTPS},
+		{8888, "https-test", nil, coreV1.ProtocolTCP, protocol.HTTPS},
+		{8888, "http2", nil, coreV1.ProtocolTCP, protocol.HTTP2},
+		{8888, "http2-test", nil, coreV1.ProtocolTCP, protocol.HTTP2},
+		{8888, "grpc", nil, coreV1.ProtocolTCP, protocol.GRPC},
+		{8888, "grpc-test", nil, coreV1.ProtocolTCP, protocol.GRPC},
+		{8888, "grpc-web", nil, coreV1.ProtocolTCP, protocol.GRPCWeb},
+		{8888, "grpc-web-test", nil, coreV1.ProtocolTCP, protocol.GRPCWeb},
+		{8888, "mongo", nil, coreV1.ProtocolTCP, protocol.Mongo},
+		{8888, "mongo-test", nil, coreV1.ProtocolTCP, protocol.Mongo},
+		{8888, "redis", nil, coreV1.ProtocolTCP, protocol.Redis},
+		{8888, "redis-test", nil, coreV1.ProtocolTCP, protocol.Redis},
+		{8888, "mysql", nil, coreV1.ProtocolTCP, protocol.MySQL},
+		{8888, "mysql-test", nil, coreV1.ProtocolTCP, protocol.MySQL},
+		{8888, "tcp", &http, coreV1.ProtocolTCP, protocol.HTTP},
 	}
 
 	// Create the list of cases for all of the names in both upper and lowercase.
@@ -81,11 +91,11 @@ func TestConvertProtocol(t *testing.T) {
 	}
 
 	for _, c := range cases {
-		testName := strings.Replace(fmt.Sprintf("%s_%s", c.name, c.proto), "-", "_", -1)
+		testName := strings.Replace(fmt.Sprintf("%s_%s_%d", c.name, c.proto, c.port), "-", "_", -1)
 		t.Run(testName, func(t *testing.T) {
-			out := kube.ConvertProtocol(c.name, c.proto)
+			out := kube.ConvertProtocol(c.port, c.name, c.proto, c.appProtocol)
 			if out != c.out {
-				t.Fatalf("convertProtocol(%q, %q) => %q, want %q", c.name, c.proto, out, c.out)
+				t.Fatalf("convertProtocol(%d, %q, %q) => %q, want %q", c.port, c.name, c.proto, out, c.out)
 			}
 		})
 	}
@@ -95,19 +105,19 @@ func BenchmarkConvertProtocol(b *testing.B) {
 	cases := []struct {
 		name  string
 		proto coreV1.Protocol
-		out   config.Protocol
+		out   protocol.Instance
 	}{
-		{"grpc-web-lowercase", coreV1.ProtocolTCP, config.ProtocolGRPCWeb},
-		{"GRPC-WEB-mixedcase", coreV1.ProtocolTCP, config.ProtocolGRPCWeb},
-		{"https-lowercase", coreV1.ProtocolTCP, config.ProtocolHTTPS},
-		{"HTTPS-mixedcase", coreV1.ProtocolTCP, config.ProtocolHTTPS},
+		{"grpc-web-lowercase", coreV1.ProtocolTCP, protocol.GRPCWeb},
+		{"GRPC-WEB-mixedcase", coreV1.ProtocolTCP, protocol.GRPCWeb},
+		{"https-lowercase", coreV1.ProtocolTCP, protocol.HTTPS},
+		{"HTTPS-mixedcase", coreV1.ProtocolTCP, protocol.HTTPS},
 	}
 
 	for _, c := range cases {
 		testName := strings.Replace(c.name, "-", "_", -1)
 		b.Run(testName, func(b *testing.B) {
 			for i := 0; i < b.N; i++ {
-				out := kube.ConvertProtocol(c.name, c.proto)
+				out := kube.ConvertProtocol(8888, c.name, c.proto, nil)
 				if out != c.out {
 					b.Fatalf("convertProtocol(%q, %q) => %q, want %q", c.name, c.proto, out, c.out)
 				}
@@ -144,6 +154,7 @@ func TestServiceConversion(t *testing.T) {
 		},
 		Spec: coreV1.ServiceSpec{
 			ClusterIP: ip,
+			Selector:  map[string]string{"foo": "bar"},
 			Ports: []coreV1.ServicePort{
 				{
 					Name:     "http",
@@ -184,6 +195,11 @@ func TestServiceConversion(t *testing.T) {
 
 	if service.Address != ip {
 		t.Fatalf("service IP incorrect => %q, want %q", service.Address, ip)
+	}
+
+	if !reflect.DeepEqual(service.Attributes.LabelSelectors, localSvc.Spec.Selector) {
+		t.Fatalf("service label selectors incorrect => %q, want %q", service.Attributes.LabelSelectors,
+			localSvc.Spec.Selector)
 	}
 
 	sa := service.ServiceAccounts
@@ -318,7 +334,6 @@ func TestExternalClusterLocalServiceConversion(t *testing.T) {
 
 	if !service.External() {
 		t.Fatal("ExternalName service (even if .cluster.local) should be external")
-		t.Fatalf("ExternalName service (even if .cluster.local) should be external")
 	}
 
 	if service.Hostname != ServiceHostname(serviceName, namespace, domainSuffix) {
@@ -337,6 +352,12 @@ func TestLBServiceConversion(t *testing.T) {
 		},
 		{
 			IP: "127.68.32.113",
+		},
+		{
+			Hostname: "127.68.32.114",
+		},
+		{
+			Hostname: "127.68.32.115",
 		},
 	}
 
@@ -385,114 +406,7 @@ func TestLBServiceConversion(t *testing.T) {
 	}
 }
 
-func TestProbesToPortsConversion(t *testing.T) {
-
-	expected := model.PortList{
-		{
-			Name:     "mgmt-3306",
-			Port:     3306,
-			Protocol: config.ProtocolTCP,
-		},
-		{
-			Name:     "mgmt-9080",
-			Port:     9080,
-			Protocol: config.ProtocolHTTP,
-		},
-	}
-
-	handlers := []coreV1.Handler{
-		{
-			TCPSocket: &coreV1.TCPSocketAction{
-				Port: intstr.IntOrString{StrVal: "mysql", Type: intstr.String},
-			},
-		},
-		{
-			TCPSocket: &coreV1.TCPSocketAction{
-				Port: intstr.IntOrString{IntVal: 3306, Type: intstr.Int},
-			},
-		},
-		{
-			HTTPGet: &coreV1.HTTPGetAction{
-				Path: "/foo",
-				Port: intstr.IntOrString{StrVal: "http-two", Type: intstr.String},
-			},
-		},
-		{
-			HTTPGet: &coreV1.HTTPGetAction{
-				Path: "/foo",
-				Port: intstr.IntOrString{IntVal: 9080, Type: intstr.Int},
-			},
-		},
-	}
-
-	podSpec := &coreV1.PodSpec{
-		Containers: []coreV1.Container{
-			{
-				Name: "scooby",
-				Ports: []coreV1.ContainerPort{
-					{
-						Name:          "mysql",
-						ContainerPort: 3306,
-					},
-					{
-						Name:          "http-two",
-						ContainerPort: 9080,
-					},
-					{
-						Name:          "http",
-						ContainerPort: 80,
-					},
-				},
-				LivenessProbe:  &coreV1.Probe{},
-				ReadinessProbe: &coreV1.Probe{},
-			},
-		},
-	}
-
-	for _, handler1 := range handlers {
-		for _, handler2 := range handlers {
-			if (handler1.TCPSocket != nil && handler2.TCPSocket != nil) ||
-				(handler1.HTTPGet != nil && handler2.HTTPGet != nil) {
-				continue
-			}
-
-			podSpec.Containers[0].LivenessProbe.Handler = handler1
-			podSpec.Containers[0].ReadinessProbe.Handler = handler2
-
-			mgmtPorts, err := ConvertProbesToPorts(podSpec)
-			if err != nil {
-				t.Fatalf("Failed to convert Probes to Ports: %v", err)
-			}
-
-			if !reflect.DeepEqual(mgmtPorts, expected) {
-				t.Fatalf("incorrect number of management ports => %v, want %v",
-					len(mgmtPorts), len(expected))
-			}
-		}
-	}
-}
-
-func TestSecureNamingSANCustomIdentity(t *testing.T) {
-
-	pod := &coreV1.Pod{}
-
-	identity := "foo"
-
-	pod.Annotations = make(map[string]string)
-	pod.Annotations[annotation.AlphaIdentity.Name] = identity
-
-	san := SecureNamingSAN(pod)
-
-	expectedSAN := fmt.Sprintf("spiffe://%v/%v", spiffe.GetTrustDomain(), identity)
-
-	if san != expectedSAN {
-		t.Fatalf("SAN match failed, SAN:%v  expectedSAN:%v", san, expectedSAN)
-	}
-
-}
-
 func TestSecureNamingSAN(t *testing.T) {
-
 	pod := &coreV1.Pod{}
 
 	pod.Annotations = make(map[string]string)

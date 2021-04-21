@@ -1,16 +1,9 @@
 [
-	{
-		"_comment": "This file is auto updated by a robot executing `https://github.com/istio/test-infra/blob/master/prow/test-infra-update-deps.sh`.",
-		"name": "PROXY_REPO_SHA",
-		"repoName": "proxy",
-		"file": "",
-		"lastStableSHA": "cb503fee7392ff2f6a7b19846c3343122dea72dc"
-	},
-	{
-                "_comment": "",
-                "name": "CNI_REPO_SHA",
-                "repoName": "cni",
-                "file": "",
-                "lastStableSHA": "16b8b4591cfe561087c9abf9d6f4e4d64bea6581"
-        }
+  {
+    "_comment": "",
+    "name": "PROXY_REPO_SHA",
+    "repoName": "proxy",
+    "file": "",
+    "lastStableSHA": "95df21b3e9b8ef35ef399654b2d79eebdd80dd8a"
+  }
 ]

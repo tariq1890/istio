@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,140 +15,346 @@
 package builder
 
 import (
-	tcp_filter "github.com/envoyproxy/go-control-plane/envoy/api/v2/listener"
-	http_filter "github.com/envoyproxy/go-control-plane/envoy/config/filter/network/http_connection_manager/v2"
-	tcp_config "github.com/envoyproxy/go-control-plane/envoy/config/filter/network/rbac/v2"
+	"fmt"
+	"strconv"
 
-	istio_rbac "istio.io/api/rbac/v1alpha1"
+	tcppb "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
+	rbacpb "github.com/envoyproxy/go-control-plane/envoy/config/rbac/v3"
+	rbachttppb "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/rbac/v3"
+	httppb "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
+	rbactcppb "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/rbac/v3"
+	"github.com/envoyproxy/go-control-plane/pkg/wellknown"
+	"github.com/hashicorp/go-multierror"
+
+	"istio.io/api/annotation"
 	"istio.io/istio/pilot/pkg/model"
+	"istio.io/istio/pilot/pkg/networking/plugin"
 	"istio.io/istio/pilot/pkg/networking/util"
-	authz_model "istio.io/istio/pilot/pkg/security/authz/model"
-	"istio.io/istio/pilot/pkg/security/authz/policy"
-	v1 "istio.io/istio/pilot/pkg/security/authz/policy/v1"
-	v2 "istio.io/istio/pilot/pkg/security/authz/policy/v2"
-	istiolog "istio.io/pkg/log"
+	authzmodel "istio.io/istio/pilot/pkg/security/authz/model"
+	"istio.io/istio/pilot/pkg/security/trustdomain"
+	"istio.io/istio/pkg/config/labels"
 )
 
-var (
-	rbacLog = istiolog.RegisterScope("rbac", "rbac debugging", 0)
-)
+var rbacPolicyMatchNever = &rbacpb.Policy{
+	Permissions: []*rbacpb.Permission{{Rule: &rbacpb.Permission_NotRule{
+		NotRule: &rbacpb.Permission{Rule: &rbacpb.Permission_Any{Any: true}},
+	}}},
+	Principals: []*rbacpb.Principal{{Identifier: &rbacpb.Principal_NotId{
+		NotId: &rbacpb.Principal{Identifier: &rbacpb.Principal_Any{Any: true}},
+	}}},
+}
 
-// Builder wraps all needed information for building the RBAC filter for a service.
+// General setting to control behavior
+type Option struct {
+	IsCustomBuilder bool
+	Logger          *AuthzLogger
+}
+
+// Builder builds Istio authorization policy to Envoy filters.
 type Builder struct {
-	isXDSMarshalingToAnyEnabled bool
-	generator                   policy.Generator
+	trustDomainBundle trustdomain.Bundle
+	option            Option
+
+	// populated when building for CUSTOM action.
+	customPolicies []model.AuthorizationPolicy
+	extensions     map[string]*builtExtAuthz
+
+	// populated when building for ALLOW/DENY/AUDIT action.
+	denyPolicies  []model.AuthorizationPolicy
+	allowPolicies []model.AuthorizationPolicy
+	auditPolicies []model.AuthorizationPolicy
 }
 
-// NewBuilder creates a builder instance that can be used to build corresponding RBAC filter config.
-func NewBuilder(serviceInstance *model.ServiceInstance, policies *model.AuthorizationPolicies, isXDSMarshalingToAnyEnabled bool) *Builder {
-	if serviceInstance.Service == nil {
-		rbacLog.Errorf("no service for serviceInstance: %v", serviceInstance)
+// New returns a new builder for the given workload with the authorization policy.
+// Returns nil if none of the authorization policies are enabled for the workload.
+func New(trustDomainBundle trustdomain.Bundle, in *plugin.InputParams, option Option) *Builder {
+	policies := in.Push.AuthzPolicies.ListAuthorizationPolicies(in.Node.ConfigNamespace, labels.Collection{in.Node.Metadata.Labels})
+	if option.IsCustomBuilder {
+		option.Logger.AppendDebugf("found %d CUSTOM actions", len(policies.Custom))
+		if len(policies.Custom) == 0 {
+			return nil
+		}
+		return &Builder{
+			customPolicies:    policies.Custom,
+			extensions:        processExtensionProvider(in),
+			trustDomainBundle: trustDomainBundle,
+			option:            option,
+		}
+	}
+
+	option.Logger.AppendDebugf("found %d DENY actions, %d ALLOW actions, %d AUDIT actions", len(policies.Deny), len(policies.Allow), len(policies.Audit))
+	if len(policies.Deny) == 0 && len(policies.Allow) == 0 && len(policies.Audit) == 0 {
 		return nil
 	}
-
-	serviceName := serviceInstance.Service.Attributes.Name
-	serviceNamespace := serviceInstance.Service.Attributes.Namespace
-	serviceHostname := string(serviceInstance.Service.Hostname)
-	if !isRbacEnabled(serviceHostname, serviceNamespace, policies) {
-		rbacLog.Debugf("RBAC disabled for service %s", serviceHostname)
-		return nil
-	}
-
-	serviceMetadata, err := authz_model.NewServiceMetadata(serviceName, serviceNamespace, serviceInstance)
-	if err != nil {
-		rbacLog.Errorf("failed to create ServiceMetadata for %s: %s", serviceName, err)
-		return nil
-	}
-
-	rbacConfig := policies.RbacConfig
-	isGlobalPermissiveEnabled := rbacConfig != nil && rbacConfig.EnforcementMode == istio_rbac.EnforcementMode_PERMISSIVE
-
-	var generator policy.Generator
-	if policies.IsRbacV2 {
-		generator = v2.NewGenerator(serviceMetadata, policies, isGlobalPermissiveEnabled)
-	} else {
-		generator = v1.NewGenerator(serviceMetadata, policies, isGlobalPermissiveEnabled)
-	}
-
 	return &Builder{
-		isXDSMarshalingToAnyEnabled: isXDSMarshalingToAnyEnabled,
-		generator:                   generator,
+		denyPolicies:      policies.Deny,
+		allowPolicies:     policies.Allow,
+		auditPolicies:     policies.Audit,
+		trustDomainBundle: trustDomainBundle,
+		option:            option,
 	}
 }
 
-// BuildHTTPFilter builds the RBAC HTTP filter.
-func (b *Builder) BuildHTTPFilter() *http_filter.HttpFilter {
-	rbacConfig := b.generator.Generate(false /* forTCPFilter */)
-	httpConfig := http_filter.HttpFilter{
-		Name: authz_model.RBACHTTPFilterName,
-	}
-	if b.isXDSMarshalingToAnyEnabled {
-		httpConfig.ConfigType = &http_filter.HttpFilter_TypedConfig{TypedConfig: util.MessageToAny(rbacConfig)}
-	} else {
-		httpConfig.ConfigType = &http_filter.HttpFilter_Config{Config: util.MessageToStruct(rbacConfig)}
+// BuildHTTP returns the HTTP filters built from the authorization policy.
+func (b Builder) BuildHTTP() []*httppb.HttpFilter {
+	if b.option.IsCustomBuilder {
+		// Use the DENY action so that a HTTP rule is properly handled when generating for TCP filter chain.
+		if configs := b.build(b.customPolicies, rbacpb.RBAC_DENY, false); configs != nil {
+			b.option.Logger.AppendDebugf("built %d HTTP filters for CUSTOM action", len(configs.http))
+			return configs.http
+		}
+		return nil
 	}
 
-	rbacLog.Debugf("built http filter config: %v", httpConfig)
-	return &httpConfig
+	var filters []*httppb.HttpFilter
+	if configs := b.build(b.auditPolicies, rbacpb.RBAC_LOG, false); configs != nil {
+		b.option.Logger.AppendDebugf("built %d HTTP filters for AUDIT action", len(configs.http))
+		filters = append(filters, configs.http...)
+	}
+	if configs := b.build(b.denyPolicies, rbacpb.RBAC_DENY, false); configs != nil {
+		b.option.Logger.AppendDebugf("built %d HTTP filters for DENY action", len(configs.http))
+		filters = append(filters, configs.http...)
+	}
+	if configs := b.build(b.allowPolicies, rbacpb.RBAC_ALLOW, false); configs != nil {
+		b.option.Logger.AppendDebugf("built %d HTTP filters for ALLOW action", len(configs.http))
+		filters = append(filters, configs.http...)
+	}
+	return filters
 }
 
-// BuildTCPFilter builds the RBAC TCP filter.
-func (b *Builder) BuildTCPFilter() *tcp_filter.Filter {
-	// The build function always return the config for HTTP filter, we need to extract the
-	// generated rules and set it in the config for TCP filter.
-	config := b.generator.Generate(true /* forTCPFilter */)
-	rbacConfig := &tcp_config.RBAC{
-		Rules:       config.Rules,
-		ShadowRules: config.ShadowRules,
-		StatPrefix:  authz_model.RBACTCPFilterStatPrefix,
+// BuildTCP returns the TCP filters built from the authorization policy.
+func (b Builder) BuildTCP() []*tcppb.Filter {
+	if b.option.IsCustomBuilder {
+		if configs := b.build(b.customPolicies, rbacpb.RBAC_DENY, true); configs != nil {
+			b.option.Logger.AppendDebugf("built %d TCP filters for CUSTOM action", len(configs.tcp))
+			return configs.tcp
+		}
+		return nil
 	}
 
-	tcpConfig := tcp_filter.Filter{
-		Name: authz_model.RBACTCPFilterName,
+	var filters []*tcppb.Filter
+	if configs := b.build(b.auditPolicies, rbacpb.RBAC_LOG, true); configs != nil {
+		b.option.Logger.AppendDebugf("built %d TCP filters for AUDIT action", len(configs.tcp))
+		filters = append(filters, configs.tcp...)
 	}
-	if b.isXDSMarshalingToAnyEnabled {
-		tcpConfig.ConfigType = &tcp_filter.Filter_TypedConfig{TypedConfig: util.MessageToAny(rbacConfig)}
-	} else {
-		tcpConfig.ConfigType = &tcp_filter.Filter_Config{Config: util.MessageToStruct(rbacConfig)}
+	if configs := b.build(b.denyPolicies, rbacpb.RBAC_DENY, true); configs != nil {
+		b.option.Logger.AppendDebugf("built %d TCP filters for DENY action", len(configs.tcp))
+		filters = append(filters, configs.tcp...)
 	}
-
-	rbacLog.Debugf("built tcp filter config: %v", tcpConfig)
-	return &tcpConfig
+	if configs := b.build(b.allowPolicies, rbacpb.RBAC_ALLOW, true); configs != nil {
+		b.option.Logger.AppendDebugf("built %d TCP filters for ALLOW action", len(configs.tcp))
+		filters = append(filters, configs.tcp...)
+	}
+	return filters
 }
 
-// isInRbacTargetList checks if a given service and namespace is included in the RbacConfig target.
-func isInRbacTargetList(serviceHostname string, namespace string, target *istio_rbac.RbacConfig_Target) bool {
-	if target == nil {
-		return false
-	}
-	for _, ns := range target.Namespaces {
-		if namespace == ns {
-			return true
+type builtConfigs struct {
+	http []*httppb.HttpFilter
+	tcp  []*tcppb.Filter
+}
+
+func (b Builder) isDryRun(policy model.AuthorizationPolicy) bool {
+	dryRun := false
+	if val, ok := policy.Annotations[annotation.IoIstioDryRun.Name]; ok {
+		var err error
+		dryRun, err = strconv.ParseBool(val)
+		if err != nil {
+			b.option.Logger.AppendError(fmt.Errorf("failed to parse the value of %s: %v", annotation.IoIstioDryRun.Name, err))
 		}
 	}
-	for _, service := range target.Services {
-		if service == serviceHostname {
-			return true
-		}
-	}
-	return false
+	return dryRun
 }
 
-// isRbacEnabled checks if a given service and namespace is enabled for Rbac.
-func isRbacEnabled(serviceHostname string, namespace string, policies *model.AuthorizationPolicies) bool {
-	if policies == nil || policies.RbacConfig == nil {
-		return false
-	}
-
-	rbacConfig := policies.RbacConfig
-	switch rbacConfig.Mode {
-	case istio_rbac.RbacConfig_ON:
-		return true
-	case istio_rbac.RbacConfig_ON_WITH_INCLUSION:
-		return isInRbacTargetList(serviceHostname, namespace, rbacConfig.Inclusion)
-	case istio_rbac.RbacConfig_ON_WITH_EXCLUSION:
-		return !isInRbacTargetList(serviceHostname, namespace, rbacConfig.Exclusion)
+func shadowRuleStatPrefix(rule *rbacpb.RBAC) string {
+	switch rule.GetAction() {
+	case rbacpb.RBAC_ALLOW:
+		return authzmodel.RBACShadowRulesAllowStatPrefix
+	case rbacpb.RBAC_DENY:
+		return authzmodel.RBACShadowRulesDenyStatPrefix
 	default:
-		return false
+		return ""
 	}
+}
+
+func (b Builder) build(policies []model.AuthorizationPolicy, action rbacpb.RBAC_Action, forTCP bool) *builtConfigs {
+	if len(policies) == 0 {
+		return nil
+	}
+
+	enforceRules := &rbacpb.RBAC{
+		Action:   action,
+		Policies: map[string]*rbacpb.Policy{},
+	}
+	shadowRules := &rbacpb.RBAC{
+		Action:   action,
+		Policies: map[string]*rbacpb.Policy{},
+	}
+
+	var providers []string
+	filterType := "HTTP"
+	if forTCP {
+		filterType = "TCP"
+	}
+	hasEnforcePolicy, hasDryRunPolicy := false, false
+	for _, policy := range policies {
+		var currentRule *rbacpb.RBAC
+		if b.isDryRun(policy) {
+			currentRule = shadowRules
+			hasDryRunPolicy = true
+		} else {
+			currentRule = enforceRules
+			hasEnforcePolicy = true
+		}
+		if b.option.IsCustomBuilder {
+			providers = append(providers, policy.Spec.GetProvider().GetName())
+		}
+		for i, rule := range policy.Spec.Rules {
+			// The name will later be used by ext_authz filter to get the evaluation result from dynamic metadata.
+			name := policyName(policy.Namespace, policy.Name, i, b.option)
+			if rule == nil {
+				b.option.Logger.AppendError(fmt.Errorf("skipped nil rule %s", name))
+				continue
+			}
+			m, err := authzmodel.New(rule)
+			if err != nil {
+				b.option.Logger.AppendError(multierror.Prefix(err, fmt.Sprintf("skipped invalid rule %s:", name)))
+				continue
+			}
+			m.MigrateTrustDomain(b.trustDomainBundle)
+			if len(b.trustDomainBundle.TrustDomains) > 1 {
+				b.option.Logger.AppendDebugf("patched source principal with trust domain aliases %v", b.trustDomainBundle.TrustDomains)
+			}
+			generated, err := m.Generate(forTCP, action)
+			if err != nil {
+				b.option.Logger.AppendDebugf("skipped rule %s on TCP filter chain: %v", name, err)
+				continue
+			}
+			if generated != nil {
+				currentRule.Policies[name] = generated
+				b.option.Logger.AppendDebugf("generated config from rule %s on %s filter chain successfully", name, filterType)
+			}
+		}
+		if len(policy.Spec.Rules) == 0 {
+			// Generate an explicit policy that never matches.
+			name := policyName(policy.Namespace, policy.Name, 0, b.option)
+			b.option.Logger.AppendDebugf("generated config from policy %s on %s filter chain successfully", name, filterType)
+			currentRule.Policies[name] = rbacPolicyMatchNever
+		}
+	}
+
+	if !hasEnforcePolicy {
+		enforceRules = nil
+	}
+	if !hasDryRunPolicy {
+		shadowRules = nil
+	}
+	if forTCP {
+		return &builtConfigs{tcp: b.buildTCP(enforceRules, shadowRules, providers)}
+	}
+	return &builtConfigs{http: b.buildHTTP(enforceRules, shadowRules, providers)}
+}
+
+func (b Builder) buildHTTP(rules *rbacpb.RBAC, shadowRules *rbacpb.RBAC, providers []string) []*httppb.HttpFilter {
+	if !b.option.IsCustomBuilder {
+		rbac := &rbachttppb.RBAC{
+			Rules:                 rules,
+			ShadowRules:           shadowRules,
+			ShadowRulesStatPrefix: shadowRuleStatPrefix(shadowRules),
+		}
+		return []*httppb.HttpFilter{
+			{
+				Name:       authzmodel.RBACHTTPFilterName,
+				ConfigType: &httppb.HttpFilter_TypedConfig{TypedConfig: util.MessageToAny(rbac)},
+			},
+		}
+	}
+
+	extauthz, err := getExtAuthz(b.extensions, providers)
+	if err != nil {
+		b.option.Logger.AppendError(multierror.Prefix(err, "failed to process CUSTOM action:"))
+		rbac := &rbachttppb.RBAC{Rules: rbacDefaultDenyAll}
+		return []*httppb.HttpFilter{
+			{
+				Name:       authzmodel.RBACHTTPFilterName,
+				ConfigType: &httppb.HttpFilter_TypedConfig{TypedConfig: util.MessageToAny(rbac)},
+			},
+		}
+	}
+	// Add the RBAC filter in shadow mode so that it only evaluates the matching rules for CUSTOM action but not enforce it.
+	// The evaluation result is stored in the dynamic metadata keyed by the policy name. And then the ext_authz filter
+	// can utilize these metadata to trigger the enforcement conditionally.
+	// See https://docs.google.com/document/d/1V4mCQCw7mlGp0zSQQXYoBdbKMDnkPOjeyUb85U07iSI/edit#bookmark=kix.jdq8u0an2r6s
+	// for more details.
+	rbac := &rbachttppb.RBAC{
+		ShadowRules:           rules,
+		ShadowRulesStatPrefix: authzmodel.RBACExtAuthzShadowRulesStatPrefix,
+	}
+	return []*httppb.HttpFilter{
+		{
+			Name:       authzmodel.RBACHTTPFilterName,
+			ConfigType: &httppb.HttpFilter_TypedConfig{TypedConfig: util.MessageToAny(rbac)},
+		},
+		{
+			Name:       wellknown.HTTPExternalAuthorization,
+			ConfigType: &httppb.HttpFilter_TypedConfig{TypedConfig: util.MessageToAny(extauthz.http)},
+		},
+	}
+}
+
+func (b Builder) buildTCP(rules *rbacpb.RBAC, shadowRules *rbacpb.RBAC, providers []string) []*tcppb.Filter {
+	if !b.option.IsCustomBuilder {
+		rbac := &rbactcppb.RBAC{
+			Rules:                 rules,
+			StatPrefix:            authzmodel.RBACTCPFilterStatPrefix,
+			ShadowRules:           shadowRules,
+			ShadowRulesStatPrefix: shadowRuleStatPrefix(shadowRules),
+		}
+		return []*tcppb.Filter{
+			{
+				Name:       authzmodel.RBACTCPFilterName,
+				ConfigType: &tcppb.Filter_TypedConfig{TypedConfig: util.MessageToAny(rbac)},
+			},
+		}
+	}
+
+	if extauthz, err := getExtAuthz(b.extensions, providers); err != nil {
+		b.option.Logger.AppendError(multierror.Prefix(err, "failed to parse CUSTOM action, will generate a deny all config:"))
+		rbac := &rbactcppb.RBAC{
+			Rules:      rbacDefaultDenyAll,
+			StatPrefix: authzmodel.RBACTCPFilterStatPrefix,
+		}
+		return []*tcppb.Filter{
+			{
+				Name:       authzmodel.RBACTCPFilterName,
+				ConfigType: &tcppb.Filter_TypedConfig{TypedConfig: util.MessageToAny(rbac)},
+			},
+		}
+	} else if extauthz.tcp == nil {
+		b.option.Logger.AppendDebugf("ignored CUSTOM action with HTTP provider on TCP filter chain")
+		return nil
+	} else {
+		rbac := &rbactcppb.RBAC{
+			ShadowRules:           rules,
+			StatPrefix:            authzmodel.RBACTCPFilterStatPrefix,
+			ShadowRulesStatPrefix: authzmodel.RBACExtAuthzShadowRulesStatPrefix,
+		}
+		return []*tcppb.Filter{
+			{
+				Name:       authzmodel.RBACTCPFilterName,
+				ConfigType: &tcppb.Filter_TypedConfig{TypedConfig: util.MessageToAny(rbac)},
+			},
+			{
+				Name:       wellknown.ExternalAuthorization,
+				ConfigType: &tcppb.Filter_TypedConfig{TypedConfig: util.MessageToAny(extauthz.tcp)},
+			},
+		}
+	}
+}
+
+func policyName(namespace, name string, rule int, option Option) string {
+	prefix := ""
+	if option.IsCustomBuilder {
+		prefix = extAuthzMatchPrefix + "-"
+	}
+	return fmt.Sprintf("%sns[%s]-policy[%s]-rule[%d]", prefix, namespace, name, rule)
 }

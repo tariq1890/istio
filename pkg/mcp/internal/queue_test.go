@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,19 +24,17 @@ import (
 	"github.com/google/go-cmp/cmp"
 )
 
-var (
-	items = []struct {
-		key string
-		val int
-	}{
-		{"collection/1", 1},
-		{"collection/2", 2},
-		{"collection/3", 3},
-		{"collection/4", 4},
-		{"collection/5", 5},
-		{"collection/6", 6},
-	}
-)
+var items = []struct {
+	key string
+	val int
+}{
+	{"collection/1", 1},
+	{"collection/2", 2},
+	{"collection/3", 3},
+	{"collection/4", 4},
+	{"collection/5", 5},
+	{"collection/6", 6},
+}
 
 func TestUniqueQueue_InitialState(t *testing.T) {
 	depth := 5

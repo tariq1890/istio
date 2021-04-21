@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,6 +15,7 @@
 package util
 
 import (
+	"crypto/ecdsa"
 	"crypto/rsa"
 	"crypto/x509"
 	"fmt"
@@ -40,7 +41,6 @@ type VerifyFields struct {
 // - building one or more chains from the certificate to a root certificate;
 // - checking fields are set as expected.
 func VerifyCertificate(privPem []byte, certChainPem []byte, rootCertPem []byte, expectedFields *VerifyFields) error {
-
 	roots := x509.NewCertPool()
 	if rootCertPem != nil {
 		if ok := roots.AppendCertsFromPEM(rootCertPem); !ok {
@@ -81,8 +81,25 @@ func VerifyCertificate(privPem []byte, certChainPem []byte, rootCertPem []byte, 
 		return err
 	}
 
-	if !reflect.DeepEqual(priv.(*rsa.PrivateKey).PublicKey, *cert.PublicKey.(*rsa.PublicKey)) {
-		return fmt.Errorf("the generated private key and cert doesn't match")
+	privRSAKey, privRSAOk := priv.(*rsa.PrivateKey)
+	pubRSAKey, pubRSAOk := cert.PublicKey.(*rsa.PublicKey)
+
+	privECKey, privECOk := priv.(*ecdsa.PrivateKey)
+	pubECKey, pubECOk := cert.PublicKey.(*ecdsa.PublicKey)
+
+	rsaMatch := privRSAOk && pubRSAOk
+	ecMatch := privECOk && pubECOk
+
+	if rsaMatch {
+		if !reflect.DeepEqual(privRSAKey.PublicKey, *pubRSAKey) {
+			return fmt.Errorf("the generated private RSA key and cert doesn't match")
+		}
+	} else if ecMatch {
+		if !reflect.DeepEqual(privECKey.PublicKey, *pubECKey) {
+			return fmt.Errorf("the generated private EC key and cert doesn't match")
+		}
+	} else {
+		return fmt.Errorf("algorithms for private key and cert do not match")
 	}
 
 	if strings.HasPrefix(host, "spiffe") {

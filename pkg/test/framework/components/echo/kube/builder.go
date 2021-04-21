@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,70 +15,44 @@
 package kube
 
 import (
+	"fmt"
 	"sync"
+	"time"
 
 	"github.com/hashicorp/go-multierror"
 
-	"istio.io/istio/pkg/test"
+	"istio.io/istio/pkg/test/framework/components/cluster"
 	"istio.io/istio/pkg/test/framework/components/echo"
-	kubeEnv "istio.io/istio/pkg/test/framework/components/environment/kube"
 	"istio.io/istio/pkg/test/framework/resource"
-
-	kubeCore "k8s.io/api/core/v1"
+	"istio.io/istio/pkg/test/scopes"
 )
 
-var _ echo.Builder = &builder{}
-
-type builder struct {
-	ctx        resource.Context
-	references []*echo.Instance
-	configs    []echo.Config
+func init() {
+	echo.RegisterFactory(cluster.Kubernetes, build)
 }
 
-func NewBuilder(ctx resource.Context) echo.Builder {
-	return &builder{
-		ctx: ctx,
-	}
-}
-
-func (b *builder) With(i *echo.Instance, cfg echo.Config) echo.Builder {
-	b.references = append(b.references, i)
-	b.configs = append(b.configs, cfg)
-	return b
-}
-
-func (b *builder) Build() error {
-	instances, err := b.newInstances()
+func build(ctx resource.Context, configs []echo.Config) (echo.Instances, error) {
+	t0 := time.Now()
+	instances, err := newInstances(ctx, configs)
 	if err != nil {
-		return err
+		return nil, fmt.Errorf("build instance: %v", err)
 	}
+	scopes.Framework.Debugf("created echo deployments in %v", time.Since(t0))
 
-	if err := b.initializeInstances(instances); err != nil {
-		return err
+	if err := startAll(instances); err != nil {
+		return nil, fmt.Errorf("failed starting kube echo instances: %v", err)
 	}
+	scopes.Framework.Debugf("successfully started kube echo instances in %v", time.Since(t0))
 
-	if err := b.waitUntilAllCallable(instances); err != nil {
-		return err
-	}
-
-	// Success... update the caller's references.
-	for i, inst := range instances {
-		*b.references[i] = inst
-	}
-	return nil
+	return instances, nil
 }
 
-func (b *builder) BuildOrFail(t test.Failer) {
-	t.Helper()
-	if err := b.Build(); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func (b *builder) newInstances() ([]echo.Instance, error) {
-	instances := make([]echo.Instance, 0, len(b.configs))
-	for _, cfg := range b.configs {
-		inst, err := newInstance(b.ctx, cfg)
+func newInstances(ctx resource.Context, configs []echo.Config) (echo.Instances, error) {
+	// TODO consider making this parallel. This was attempted but had issues with concurrent writes
+	// it should be possible though.
+	instances := make([]echo.Instance, 0, len(configs))
+	for _, cfg := range configs {
+		inst, err := newInstance(ctx, cfg)
 		if err != nil {
 			return nil, err
 		}
@@ -87,34 +61,25 @@ func (b *builder) newInstances() ([]echo.Instance, error) {
 	return instances, nil
 }
 
-func (b *builder) initializeInstances(instances []echo.Instance) error {
-	env := b.ctx.Environment().(*kubeEnv.Environment)
-
+func startAll(instances echo.Instances) error {
 	// Wait to receive the k8s Endpoints for each Echo Instance.
 	wg := sync.WaitGroup{}
-	instanceEndpoints := make([]*kubeCore.Endpoints, len(instances))
 	aggregateErrMux := &sync.Mutex{}
 	var aggregateErr error
-	for i, inst := range instances {
+	for _, i := range instances {
+		inst := i.(*instance)
 		wg.Add(1)
-
-		instanceIndex := i
-		serviceName := inst.Config().Service
-		serviceNamespace := inst.Config().Namespace.Name()
 
 		// Run the waits in parallel.
 		go func() {
 			defer wg.Done()
 
-			// Wait until all the endpoints are ready for this service
-			_, endpoints, err := env.WaitUntilServiceEndpointsAreReady(serviceNamespace, serviceName)
-			if err != nil {
+			if err := inst.Start(); err != nil {
 				aggregateErrMux.Lock()
-				aggregateErr = multierror.Append(aggregateErr, err)
+				aggregateErr = multierror.Append(aggregateErr, fmt.Errorf("start %v/%v/%v: %v",
+					inst.ID(), inst.Config().Service, inst.Address(), err))
 				aggregateErrMux.Unlock()
-				return
 			}
-			instanceEndpoints[instanceIndex] = endpoints
 		}()
 	}
 
@@ -124,35 +89,5 @@ func (b *builder) initializeInstances(instances []echo.Instance) error {
 		return aggregateErr
 	}
 
-	// Initialize the workloads for each instance.
-	for i, inst := range instances {
-		if err := inst.(*instance).initialize(instanceEndpoints[i]); err != nil {
-			return err
-		}
-	}
 	return nil
-}
-
-func (b *builder) waitUntilAllCallable(instances []echo.Instance) error {
-	// Now wait for each endpoint to be callable from all others.
-	wg := sync.WaitGroup{}
-	aggregateErrMux := &sync.Mutex{}
-	var aggregateErr error
-	for _, inst := range instances {
-		wg.Add(1)
-
-		source := inst
-		go func() {
-			defer wg.Done()
-
-			if err := source.WaitUntilCallable(instances...); err != nil {
-				aggregateErrMux.Lock()
-				aggregateErr = multierror.Append(aggregateErr, err)
-				aggregateErrMux.Unlock()
-			}
-		}()
-	}
-	wg.Wait()
-
-	return aggregateErr
 }

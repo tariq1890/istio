@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,40 +21,42 @@ import (
 	"sort"
 
 	"istio.io/istio/pilot/pkg/config/kube/crd"
-	"istio.io/istio/pilot/pkg/model"
+	"istio.io/istio/pkg/config"
+	"istio.io/istio/pkg/config/schema/collection"
+	"istio.io/istio/pkg/config/schema/collections"
 	"istio.io/pkg/log"
 )
 
-var (
-	supportedExtensions = map[string]bool{
-		".yaml": true,
-		".yml":  true,
-	}
-)
+var supportedExtensions = map[string]bool{
+	".yaml": true,
+	".yml":  true,
+}
 
 // FileSnapshot holds a reference to a file directory that contains crd
 // config and filter criteria for which of those configs will be parsed.
 type FileSnapshot struct {
 	root             string
-	configTypeFilter map[string]bool
+	domainSuffix     string
+	configTypeFilter map[config.GroupVersionKind]bool
 }
 
 // NewFileSnapshot returns a snapshotter.
-// If no types are provided in the descriptor, all IstioConfigTypes will be allowed.
-func NewFileSnapshot(root string, descriptor model.ConfigDescriptor) *FileSnapshot {
+// If no types are provided in the descriptor, all Istio types will be allowed.
+func NewFileSnapshot(root string, schemas collection.Schemas, domainSuffix string) *FileSnapshot {
 	snapshot := &FileSnapshot{
 		root:             root,
-		configTypeFilter: make(map[string]bool),
+		domainSuffix:     domainSuffix,
+		configTypeFilter: make(map[config.GroupVersionKind]bool),
 	}
 
-	types := descriptor.Types()
-	if len(types) == 0 {
-		types = model.IstioConfigTypes.Types()
+	ss := schemas.All()
+	if len(ss) == 0 {
+		ss = collections.Pilot.All()
 	}
 
-	for _, k := range types {
-		if schema, ok := model.IstioConfigTypes.GetByType(k); ok {
-			snapshot.configTypeFilter[schema.Type] = true
+	for _, k := range ss {
+		if _, ok := collections.Pilot.FindByGroupVersionKind(k.Resource().GroupVersionKind()); ok {
+			snapshot.configTypeFilter[k.Resource().GroupVersionKind()] = true
 		}
 	}
 
@@ -63,8 +65,8 @@ func NewFileSnapshot(root string, descriptor model.ConfigDescriptor) *FileSnapsh
 
 // ReadConfigFiles parses files in the root directory and returns a sorted slice of
 // eligible model.Config. This can be used as a configFunc when creating a Monitor.
-func (f *FileSnapshot) ReadConfigFiles() ([]*model.Config, error) {
-	var result []*model.Config
+func (f *FileSnapshot) ReadConfigFiles() ([]*config.Config, error) {
+	var result []*config.Config
 
 	err := filepath.Walk(f.root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -77,7 +79,7 @@ func (f *FileSnapshot) ReadConfigFiles() ([]*model.Config, error) {
 			log.Warnf("Failed to read %s: %v", path, err)
 			return err
 		}
-		configs, err := parseInputs(data)
+		configs, err := parseInputs(data, f.domainSuffix)
 		if err != nil {
 			log.Warnf("Failed to parse %s: %v", path, err)
 			return err
@@ -85,7 +87,7 @@ func (f *FileSnapshot) ReadConfigFiles() ([]*model.Config, error) {
 
 		// Filter any unsupported types before appending to the result.
 		for _, cfg := range configs {
-			if !f.configTypeFilter[cfg.Type] {
+			if !f.configTypeFilter[cfg.GroupVersionKind] {
 				continue
 			}
 			result = append(result, cfg)
@@ -102,19 +104,20 @@ func (f *FileSnapshot) ReadConfigFiles() ([]*model.Config, error) {
 }
 
 // parseInputs is identical to crd.ParseInputs, except that it returns an array of config pointers.
-func parseInputs(data []byte) ([]*model.Config, error) {
+func parseInputs(data []byte, domainSuffix string) ([]*config.Config, error) {
 	configs, _, err := crd.ParseInputs(string(data))
 
 	// Convert to an array of pointers.
-	refs := make([]*model.Config, len(configs))
+	refs := make([]*config.Config, len(configs))
 	for i := range configs {
 		refs[i] = &configs[i]
+		refs[i].Domain = domainSuffix
 	}
 	return refs, err
 }
 
-// byKey is an array of config objects that is capable or sorting by Namespace, Type, and Name.
-type byKey []*model.Config
+// byKey is an array of config objects that is capable or sorting by Namespace, GroupVersionKind, and Name.
+type byKey []*config.Config
 
 func (rs byKey) Len() int {
 	return len(rs)

@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,13 +17,22 @@ package util
 import (
 	"errors"
 	"io/ioutil"
+	"os"
+	"regexp"
 	"strings"
 	"testing"
 
 	"github.com/pmezard/go-difflib/difflib"
 
+	"istio.io/istio/pkg/file"
 	"istio.io/pkg/env"
 )
+
+const (
+	statusReplacement = "sidecar.istio.io/status: '{\"version\":\"\","
+)
+
+var statusPattern = regexp.MustCompile("sidecar.istio.io/status: '{\"version\":\"([0-9a-f]+)\",")
 
 // Refresh controls whether to update the golden artifacts instead.
 // It is set using the environment variable REFRESH_GOLDEN.
@@ -92,11 +101,16 @@ func ReadGoldenFile(content []byte, goldenFile string, t *testing.T) []byte {
 	return ReadFile(goldenFile, t)
 }
 
+// StripVersion strips the version fields of a YAML content.
+func StripVersion(yaml []byte) []byte {
+	return statusPattern.ReplaceAllLiteral(yaml, []byte(statusReplacement))
+}
+
 // RefreshGoldenFile updates the golden file with the given content
 func RefreshGoldenFile(content []byte, goldenFile string, t *testing.T) {
 	if Refresh() {
 		t.Logf("Refreshing golden file %s", goldenFile)
-		if err := ioutil.WriteFile(goldenFile, content, 0644); err != nil {
+		if err := file.AtomicWrite(goldenFile, content, os.FileMode(0644)); err != nil {
 			t.Errorf(err.Error())
 		}
 	}

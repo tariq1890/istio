@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,9 +19,11 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/gogo/protobuf/jsonpb"
+	"github.com/golang/protobuf/jsonpb"
+	"sigs.k8s.io/yaml"
 
 	"istio.io/istio/istioctl/pkg/util/configdump"
+	sdscompare "istio.io/istio/istioctl/pkg/writer/compare/sds"
 )
 
 // ConfigWriter is a writer for processing responses from the Envoy Admin config_dump endpoint
@@ -44,7 +46,7 @@ func (c *ConfigWriter) Prime(b []byte) error {
 }
 
 // PrintBootstrapDump prints just the bootstrap config dump to the ConfigWriter stdout
-func (c *ConfigWriter) PrintBootstrapDump() error {
+func (c *ConfigWriter) PrintBootstrapDump(outputFormat string) error {
 	if c.configDump == nil {
 		return fmt.Errorf("config writer has not been primed")
 	}
@@ -53,8 +55,81 @@ func (c *ConfigWriter) PrintBootstrapDump() error {
 		return err
 	}
 	jsonm := &jsonpb.Marshaler{Indent: "    "}
-	if err := jsonm.Marshal(c.Stdout, bootstrapDump); err != nil {
+	out, err := jsonm.MarshalToString(bootstrapDump)
+	if err != nil {
 		return fmt.Errorf("unable to marshal bootstrap in Envoy config dump")
+	}
+	if outputFormat == "yaml" {
+		outbyte, err := yaml.JSONToYAML([]byte(out))
+		if err != nil {
+			return err
+		}
+		out = string(outbyte)
+	}
+	fmt.Fprintln(c.Stdout, out)
+	return nil
+}
+
+// PrintSecretDump prints just the secret config dump to the ConfigWriter stdout
+func (c *ConfigWriter) PrintSecretDump(outputFormat string) error {
+	if c.configDump == nil {
+		return fmt.Errorf("config writer has not been primed")
+	}
+	secretDump, err := c.configDump.GetSecretConfigDump()
+	if err != nil {
+		return fmt.Errorf("sidecar doesn't support secrets: %v", err)
+	}
+	jsonm := &jsonpb.Marshaler{Indent: "    "}
+	out, err := jsonm.MarshalToString(secretDump)
+	if err != nil {
+		return fmt.Errorf("unable to marshal secrets in Envoy config dump")
+	}
+	if outputFormat == "yaml" {
+		outbyte, err := yaml.JSONToYAML([]byte(out))
+		if err != nil {
+			return err
+		}
+		out = string(outbyte)
+	}
+	fmt.Fprintln(c.Stdout, out)
+	return nil
+}
+
+// PrintSecretSummary prints a summary of dynamic active secrets from the config dump
+func (c *ConfigWriter) PrintSecretSummary() error {
+	secretDump, err := c.configDump.GetSecretConfigDump()
+	if err != nil {
+		return err
+	}
+	if len(secretDump.DynamicActiveSecrets) == 0 &&
+		len(secretDump.DynamicWarmingSecrets) == 0 {
+		fmt.Fprintln(c.Stdout, "No active or warming secrets found.")
+		return nil
+	}
+	secretItems, err := sdscompare.GetEnvoySecrets(c.configDump)
+	if err != nil {
+		return err
+	}
+
+	secretWriter := sdscompare.NewSDSWriter(c.Stdout, sdscompare.TABULAR)
+	return secretWriter.PrintSecretItems(secretItems)
+}
+
+func (c *ConfigWriter) PrintFullSummary(cf ClusterFilter, lf ListenerFilter, rf RouteFilter) error {
+	if err := c.PrintClusterSummary(cf); err != nil {
+		return err
+	}
+	_, _ = c.Stdout.Write([]byte("\n"))
+	if err := c.PrintListenerSummary(lf); err != nil {
+		return err
+	}
+	_, _ = c.Stdout.Write([]byte("\n"))
+	if err := c.PrintRouteSummary(rf); err != nil {
+		return err
+	}
+	_, _ = c.Stdout.Write([]byte("\n"))
+	if err := c.PrintSecretSummary(); err != nil {
+		return err
 	}
 	return nil
 }

@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,8 +17,10 @@ package common
 import (
 	"fmt"
 	"strings"
+	"time"
 
-	"istio.io/istio/pkg/config"
+	"istio.io/istio/pkg/config/constants"
+	"istio.io/istio/pkg/config/protocol"
 	"istio.io/istio/pkg/test/framework/components/echo"
 	"istio.io/istio/pkg/test/framework/components/namespace"
 	"istio.io/istio/pkg/test/framework/resource"
@@ -28,9 +30,10 @@ const (
 	defaultService   = "echo"
 	defaultVersion   = "v1"
 	defaultNamespace = "echo"
+	defaultDomain    = constants.DefaultKubernetesDomain
 )
 
-func FillInDefaults(ctx resource.Context, defaultDomain string, c *echo.Config) (err error) {
+func FillInDefaults(ctx resource.Context, c *echo.Config) (err error) {
 	if c.Service == "" {
 		c.Service = defaultService
 	}
@@ -43,9 +46,28 @@ func FillInDefaults(ctx resource.Context, defaultDomain string, c *echo.Config) 
 		c.Domain = defaultDomain
 	}
 
+	// Convert legacy config to workload oritended.
+	if c.Subsets == nil {
+		c.Subsets = []echo.SubsetConfig{
+			{
+				Version: c.Version,
+			},
+		}
+	}
+
+	for i := range c.Subsets {
+		if c.Subsets[i].Version == "" {
+			c.Subsets[i].Version = c.Version
+		}
+	}
+	AddPortIfMissing(c, protocol.GRPC)
 	// If no namespace was provided, use the default.
-	if c.Namespace == nil {
-		if c.Namespace, err = namespace.New(ctx, defaultNamespace, true); err != nil {
+	if c.Namespace == nil && ctx != nil {
+		nsConfig := namespace.Config{
+			Prefix: defaultNamespace,
+			Inject: true,
+		}
+		if c.Namespace, err = namespace.New(ctx, nsConfig); err != nil {
 			return err
 		}
 	}
@@ -70,6 +92,18 @@ func FillInDefaults(ctx resource.Context, defaultDomain string, c *echo.Config) 
 			portGen.Instance.SetUsed(p.InstancePort)
 		}
 	}
+	for _, p := range c.WorkloadOnlyPorts {
+		if p.Port > 0 {
+			if portGen.Instance.IsUsed(p.Port) {
+				return fmt.Errorf("failed configuring workload only port %d: port already used", p.Port)
+			}
+			portGen.Instance.SetUsed(p.Port)
+			if portGen.Service.IsUsed(p.Port) {
+				return fmt.Errorf("failed configuring workload only port %d: port already used", p.Port)
+			}
+			portGen.Service.SetUsed(p.Port)
+		}
+	}
 
 	// Second pass: try to make unassigned instance ports match service port.
 	for i, p := range c.Ports {
@@ -89,11 +123,17 @@ func FillInDefaults(ctx resource.Context, defaultDomain string, c *echo.Config) 
 		}
 	}
 
+	// If readiness probe is not specified by a test, wait a long time
+	// Waiting forever would cause the test to timeout and lose logs
+	if c.ReadinessTimeout == 0 {
+		c.ReadinessTimeout = time.Minute * 10
+	}
+
 	return nil
 }
 
 // GetPortForProtocol returns the first port found with the given protocol, or nil if none was found.
-func GetPortForProtocol(c *echo.Config, protocol config.Protocol) *echo.Port {
+func GetPortForProtocol(c *echo.Config, protocol protocol.Instance) *echo.Port {
 	for _, p := range c.Ports {
 		if p.Protocol == protocol {
 			return &p
@@ -103,7 +143,7 @@ func GetPortForProtocol(c *echo.Config, protocol config.Protocol) *echo.Port {
 }
 
 // AddPortIfMissing adds a port for the given protocol if none was found.
-func AddPortIfMissing(c *echo.Config, protocol config.Protocol) {
+func AddPortIfMissing(c *echo.Config, protocol protocol.Instance) {
 	if GetPortForProtocol(c, protocol) == nil {
 		c.Ports = append([]echo.Port{
 			{
