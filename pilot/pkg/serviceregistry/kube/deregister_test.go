@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,15 +18,13 @@ import (
 	"testing"
 
 	v1 "k8s.io/api/core/v1"
-
-	"istio.io/pkg/log"
 )
 
 // TestRemoveIPFromEndpoint if the provided IP to deregister has already
 // been registered.
 func TestRemoveIPFromEndpoint(t *testing.T) {
 	var match bool
-	var tests = []struct {
+	tests := []struct {
 		input1   *v1.Endpoints
 		input2   string
 		expected bool
@@ -38,7 +36,7 @@ func TestRemoveIPFromEndpoint(t *testing.T) {
 					{
 						[]v1.EndpointAddress{{"10.128.0.17", "", nil, nil}},
 						[]v1.EndpointAddress{{"", "", nil, nil}},
-						[]v1.EndpointPort{{"3309", 3309, "TCP"}},
+						[]v1.EndpointPort{{"3309", 3309, "TCP", nil}},
 					},
 				},
 			},
@@ -51,7 +49,7 @@ func TestRemoveIPFromEndpoint(t *testing.T) {
 					{
 						[]v1.EndpointAddress{{"10.128.0.18", "", nil, nil}},
 						[]v1.EndpointAddress{{"", "", nil, nil}},
-						[]v1.EndpointPort{{"3309", 3309, "TCP"}},
+						[]v1.EndpointPort{{"3309", 3309, "TCP", nil}},
 					},
 				},
 			},
@@ -64,7 +62,7 @@ func TestRemoveIPFromEndpoint(t *testing.T) {
 					{
 						[]v1.EndpointAddress{{"10.128.0.17", "", nil, nil}, {"10.128.0.18", "", nil, nil}, {"10.128.0.19", "", nil, nil}},
 						[]v1.EndpointAddress{{"", "", nil, nil}},
-						[]v1.EndpointPort{{"3309", 3309, "TCP"}},
+						[]v1.EndpointPort{{"3309", 3309, "TCP", nil}},
 					},
 				},
 			},
@@ -77,12 +75,12 @@ func TestRemoveIPFromEndpoint(t *testing.T) {
 					{
 						[]v1.EndpointAddress{{"10.128.0.17", "", nil, nil}, {"10.128.0.18", "", nil, nil}, {"10.128.0.19", "", nil, nil}},
 						[]v1.EndpointAddress{{"", "", nil, nil}},
-						[]v1.EndpointPort{{"3309", 3309, "TCP"}},
+						[]v1.EndpointPort{{"3309", 3309, "TCP", nil}},
 					},
 					{
 						[]v1.EndpointAddress{{"10.128.0.20", "", nil, nil}, {"10.128.0.21", "", nil, nil}, {"10.128.0.22", "", nil, nil}},
 						[]v1.EndpointAddress{{"", "", nil, nil}},
-						[]v1.EndpointPort{{"3308", 3308, "TCP"}},
+						[]v1.EndpointPort{{"3308", 3308, "TCP", nil}},
 					},
 				},
 			},
@@ -95,12 +93,12 @@ func TestRemoveIPFromEndpoint(t *testing.T) {
 					{
 						[]v1.EndpointAddress{{"10.128.0.17", "", nil, nil}, {"10.128.0.18", "", nil, nil}, {"10.128.0.19", "", nil, nil}},
 						[]v1.EndpointAddress{{"", "", nil, nil}},
-						[]v1.EndpointPort{{"3309", 3309, "TCP"}},
+						[]v1.EndpointPort{{"3309", 3309, "TCP", nil}},
 					},
 					{
 						[]v1.EndpointAddress{{"10.128.0.20", "", nil, nil}, {"10.128.0.21", "", nil, nil}, {"10.128.0.22", "", nil, nil}},
 						[]v1.EndpointAddress{{"", "", nil, nil}},
-						[]v1.EndpointPort{{"3308", 3308, "TCP"}},
+						[]v1.EndpointPort{{"3308", 3308, "TCP", nil}},
 					},
 				},
 			},
@@ -112,11 +110,6 @@ func TestRemoveIPFromEndpoint(t *testing.T) {
 		match = removeIPFromEndpoint(tst.input1, tst.input2)
 		if tst.expected != match {
 			t.Errorf("Expected %t got %t", tst.expected, match)
-		}
-		if !match {
-			log.Infof("Ip %s does not exist in Endpoint %v", tst.input2, tst.input1)
-		} else {
-			log.Infof("Ip %s exist in Endpoint %v", tst.input2, tst.input1)
 		}
 	}
 }

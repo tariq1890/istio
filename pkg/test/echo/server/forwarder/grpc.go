@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -52,7 +52,7 @@ func (c *grpcProtocol) makeRequest(ctx context.Context, req *request) (string, e
 
 	var outBuffer bytes.Buffer
 	grpcReq := &proto.EchoRequest{
-		Message: fmt.Sprintf("request #%d", req.RequestID),
+		Message: req.Message,
 	}
 	outBuffer.WriteString(fmt.Sprintf("[%d] grpcecho.Echo(%v)\n", req.RequestID, req))
 

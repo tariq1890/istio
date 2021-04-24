@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,36 +15,78 @@
 package stsclient
 
 import (
-	"context"
+	"errors"
+	"fmt"
 	"testing"
+	"time"
 
-	"istio.io/istio/security/pkg/nodeagent/plugin/providers/google/stsclient/test"
+	"istio.io/istio/pkg/test/util/retry"
+	"istio.io/istio/security/pkg/monitoring"
+	"istio.io/istio/security/pkg/nodeagent/util"
+	"istio.io/istio/security/pkg/stsservice/tokenmanager/google/mock"
+	"istio.io/istio/tests/util/leak"
 )
 
 func TestGetFederatedToken(t *testing.T) {
-	tlsFlag = false
-	defer func() {
-		tlsFlag = true
-	}()
+	GKEClusterURL = mock.FakeGKEClusterURL
+	r := NewSecureTokenServiceExchanger(nil, mock.FakeTrustDomain)
+	r.backoff = time.Millisecond
 
-	r := NewPlugin()
-
-	ms, err := test.StartNewServer()
-	secureTokenEndpoint = ms.URL + "/v1/identitybindingtoken"
-	defer func() {
-		ms.Stop()
-		secureTokenEndpoint = "https://securetoken.googleapis.com/v1/identitybindingtoken"
-	}()
-
+	ms, err := mock.StartNewServer(t, mock.Config{Port: 0})
 	if err != nil {
-		t.Fatalf("failed to start a mock server %v", err)
+		t.Fatalf("failed to start a mock server: %v", err)
 	}
+	SecureTokenEndpoint = ms.URL + "/v1/token"
+	t.Cleanup(func() {
+		if err := ms.Stop(); err != nil {
+			t.Logf("failed to stop mock server: %v", err)
+		}
+		SecureTokenEndpoint = "https://sts.googleapis.com/v1/token"
+	})
 
-	token, _, _, err := r.ExchangeToken(context.Background(), "", "")
-	if err != nil {
-		t.Fatalf("failed to call exchange token %v", err)
-	}
-	if got, want := token, "footoken"; got != want {
-		t.Errorf("Access token got %q, expected %q", "footoken", token)
-	}
+	t.Run("exchange", func(t *testing.T) {
+		token, err := r.ExchangeToken(mock.FakeSubjectToken)
+		if err != nil {
+			t.Fatalf("failed to call exchange token %v", err)
+		}
+		if token != mock.FakeFederatedToken {
+			t.Errorf("Access token got %q, expected %q", token, mock.FakeFederatedToken)
+		}
+	})
+	t.Run("error", func(t *testing.T) {
+		ms.SetGenFedTokenError(errors.New("fake error"))
+		t.Cleanup(func() {
+			ms.SetGenFedTokenError(nil)
+		})
+		_, err := r.ExchangeToken(mock.FakeSubjectToken)
+		if err == nil {
+			t.Fatalf("expected error %v", err)
+		}
+	})
+
+	t.Run("retry", func(t *testing.T) {
+		monitoring.Reset()
+		ms.SetGenFedTokenError(errors.New("fake error"))
+		_, err := r.ExchangeToken(mock.FakeSubjectToken)
+		if err == nil {
+			t.Fatalf("expected error %v", err)
+		}
+
+		retry.UntilSuccessOrFail(t, func() error {
+			g, err := util.GetMetricsCounterValueWithTags("num_outgoing_retries", map[string]string{
+				"request_type": monitoring.TokenExchange,
+			})
+			if err != nil {
+				return err
+			}
+			if g <= 0 {
+				return fmt.Errorf("expected retries, got %v", g)
+			}
+			return nil
+		}, retry.Timeout(time.Second*5))
+	})
+}
+
+func TestMain(m *testing.M) {
+	leak.CheckMain(m)
 }

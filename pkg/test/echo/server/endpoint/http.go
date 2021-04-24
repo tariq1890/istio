@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,21 +17,24 @@ package endpoint
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"fmt"
 	"math/rand"
 	"net"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gorilla/websocket"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
 
 	"istio.io/istio/pkg/test/echo/common"
 	"istio.io/istio/pkg/test/echo/common/response"
 	"istio.io/istio/pkg/test/util/retry"
-	"istio.io/pkg/log"
 )
 
 const (
@@ -39,14 +42,12 @@ const (
 	readyInterval = 2 * time.Second
 )
 
-var (
-	webSocketUpgrader = websocket.Upgrader{
-		CheckOrigin: func(r *http.Request) bool {
-			// allow all connections by default
-			return true
-		},
-	}
-)
+var webSocketUpgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool {
+		// allow all connections by default
+		return true
+	},
+}
 
 var _ Instance = &httpInstance{}
 
@@ -61,11 +62,16 @@ func newHTTP(config Config) Instance {
 	}
 }
 
+func (s *httpInstance) GetConfig() Config {
+	return s.Config
+}
+
 func (s *httpInstance) Start(onReady OnReadyFunc) error {
+	h2s := &http2.Server{}
 	s.server = &http.Server{
-		Handler: &httpHandler{
+		Handler: h2c.NewHandler(&httpHandler{
 			Config: s.Config,
-		},
+		}, h2s),
 	}
 
 	var listener net.Listener
@@ -74,9 +80,29 @@ func (s *httpInstance) Start(onReady OnReadyFunc) error {
 	if s.isUDS() {
 		port = 0
 		listener, err = listenOnUDS(s.UDSServer)
+	} else if s.Port.TLS {
+		cert, cerr := tls.LoadX509KeyPair(s.TLSCert, s.TLSKey)
+		if cerr != nil {
+			return fmt.Errorf("could not load TLS keys: %v", cerr)
+		}
+		config := &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			NextProtos:   []string{"h2", "http/1.1", "http/1.0"},
+			GetConfigForClient: func(info *tls.ClientHelloInfo) (*tls.Config, error) {
+				// There isn't a way to pass through all ALPNs presented by the client down to the
+				// HTTP server to return in the response. However, for debugging, we can at least log
+				// them at this level.
+				epLog.Infof("TLS connection with alpn: %v", info.SupportedProtos)
+				return nil, nil
+			},
+		}
+		// Listen on the given port and update the port if it changed from what was passed in.
+		listener, port, err = listenOnAddressTLS(s.ListenerIP, s.Port.Port, config)
+		// Store the actual listening port back to the argument.
+		s.Port.Port = port
 	} else {
 		// Listen on the given port and update the port if it changed from what was passed in.
-		listener, port, err = listenOnPort(s.Port.Port)
+		listener, port, err = listenOnAddress(s.ListenerIP, s.Port.Port)
 		// Store the actual listening port back to the argument.
 		s.Port.Port = port
 	}
@@ -87,6 +113,9 @@ func (s *httpInstance) Start(onReady OnReadyFunc) error {
 
 	if s.isUDS() {
 		fmt.Printf("Listening HTTP/1.1 on %v\n", s.UDSServer)
+	} else if s.Port.TLS {
+		s.server.Addr = fmt.Sprintf(":%d", port)
+		fmt.Printf("Listening HTTPS/1.1 on %v\n", port)
 	} else {
 		s.server.Addr = fmt.Sprintf(":%d", port)
 		fmt.Printf("Listening HTTP/1.1 on %v\n", port)
@@ -119,12 +148,15 @@ func (s *httpInstance) awaitReady(onReady OnReadyFunc, port int) {
 				return net.Dial("unix", s.UDSServer)
 			},
 		}
+	} else if s.Port.TLS {
+		url = fmt.Sprintf("https://127.0.0.1:%d", port)
+		client.Transport = &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
 	} else {
 		url = fmt.Sprintf("http://127.0.0.1:%d", port)
 	}
 
 	err := retry.UntilSuccess(func() error {
-		resp, err := http.Get(url)
+		resp, err := client.Get(url)
 		if err != nil {
 			return err
 		}
@@ -141,9 +173,9 @@ func (s *httpInstance) awaitReady(onReady OnReadyFunc, port int) {
 	}, retry.Timeout(readyTimeout), retry.Delay(readyInterval))
 
 	if err != nil {
-		log.Errorf("readiness failed for endpoint %s: %v", url, err)
+		epLog.Errorf("readiness failed for endpoint %s: %v", url, err)
 	} else {
-		log.Infof("ready for HTTP endpoint %s", url)
+		epLog.Infof("ready for HTTP endpoint %s", url)
 	}
 }
 
@@ -167,12 +199,16 @@ type codeAndSlices struct {
 }
 
 func (h *httpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	log.Infof("HTTP Request:\n  Method: %s\n  URL: %v,\n  Host: %s\n  Headers: %v}",
+	epLog.Infof("HTTP Request:\n  Method: %s\n  URL: %v,\n  Host: %s\n  Headers: %v",
 		r.Method, r.URL, r.Host, r.Header)
-
+	if h.Port == nil {
+		defer common.Metrics.HTTPRequests.With(common.PortLabel.Value("uds")).Increment()
+	} else {
+		defer common.Metrics.HTTPRequests.With(common.PortLabel.Value(strconv.Itoa(h.Port.Port))).Increment()
+	}
 	if !h.IsServerReady() {
 		// Handle readiness probe failure.
-		log.Infof("HTTP service not ready, returning 503")
+		epLog.Infof("HTTP service not ready, returning 503")
 		w.WriteHeader(http.StatusServiceUnavailable)
 		return
 	}
@@ -186,7 +222,7 @@ func (h *httpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // nolint: interfacer
 func writeError(out *bytes.Buffer, msg string) {
-	log.Warn(msg)
+	epLog.Warn(msg)
 	_, _ = out.WriteString(msg + "\n")
 }
 
@@ -195,6 +231,12 @@ func (h *httpHandler) echo(w http.ResponseWriter, r *http.Request) {
 
 	if err := r.ParseForm(); err != nil {
 		writeError(&body, "ParseForm() error: "+err.Error())
+	}
+
+	// If the request has form ?delay=[:duration] wait for duration
+	// For example, ?delay=10s will cause the response to wait 10s before responding
+	if err := delayResponse(r); err != nil {
+		writeError(&body, "error delaying response error: "+err.Error())
 	}
 
 	// If the request has form ?headers=name:value[,name:value]* return those headers in response
@@ -213,9 +255,9 @@ func (h *httpHandler) echo(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/text")
 	if _, err := w.Write(body.Bytes()); err != nil {
-		log.Warna(err)
+		epLog.Warn(err)
 	}
-	log.Infof("Response Headers: %+v", w.Header())
+	epLog.Infof("Response Headers: %+v", w.Header())
 }
 
 func (h *httpHandler) webSocketEcho(w http.ResponseWriter, r *http.Request) {
@@ -223,7 +265,7 @@ func (h *httpHandler) webSocketEcho(w http.ResponseWriter, r *http.Request) {
 	// First send upgrade headers
 	c, err := webSocketUpgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Warn("websocket-echo upgrade failed: " + err.Error())
+		epLog.Warn("websocket-echo upgrade failed: " + err.Error())
 		return
 	}
 
@@ -232,7 +274,7 @@ func (h *httpHandler) webSocketEcho(w http.ResponseWriter, r *http.Request) {
 	// ping
 	mt, message, err := c.ReadMessage()
 	if err != nil {
-		log.Warn("websocket-echo read failed: " + err.Error())
+		epLog.Warn("websocket-echo read failed: " + err.Error())
 		return
 	}
 
@@ -260,22 +302,53 @@ func (h *httpHandler) addResponsePayload(r *http.Request, body *bytes.Buffer) {
 	writeField(body, response.ServiceVersionField, h.Version)
 	writeField(body, response.ServicePortField, port)
 	writeField(body, response.HostField, r.Host)
+	// Use raw path, we don't want golang normalizing anything since we use this for testing purposes
+	writeField(body, response.URLField, r.RequestURI)
+	writeField(body, response.ClusterField, h.Cluster)
+	writeField(body, response.IstioVersionField, h.IstioVersion)
 
-	writeField(body, response.Field("Method"), r.Method)
-	writeField(body, response.Field("URL"), r.URL.String())
-	writeField(body, response.Field("Proto"), r.Proto)
-	writeField(body, response.Field("RemoteAddr"), r.RemoteAddr)
-	writeField(body, response.Field("Method"), r.Method)
+	writeField(body, "Method", r.Method)
+	writeField(body, "Proto", r.Proto)
+	ip, _, _ := net.SplitHostPort(r.RemoteAddr)
+	writeField(body, response.IPField, ip)
 
-	for name, values := range r.Header {
+	// Note: since this is the NegotiatedProtocol, it will be set to empty if the client sends an ALPN
+	// not supported by the server (ie one of h2,http/1.1,http/1.0)
+	var alpn string
+	if r.TLS != nil {
+		alpn = r.TLS.NegotiatedProtocol
+	}
+	writeField(body, "Alpn", alpn)
+
+	keys := []string{}
+	for k := range r.Header {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		values := r.Header[key]
 		for _, value := range values {
-			writeField(body, response.Field(name), value)
+			writeField(body, response.Field(key), value)
 		}
 	}
 
 	if hostname, err := os.Hostname(); err == nil {
 		writeField(body, response.HostnameField, hostname)
 	}
+}
+
+func delayResponse(request *http.Request) error {
+	d := request.FormValue("delay")
+	if len(d) == 0 {
+		return nil
+	}
+
+	t, err := time.ParseDuration(d)
+	if err != nil {
+		return err
+	}
+	time.Sleep(t)
+	return nil
 }
 
 func setHeaderResponseFromHeaders(request *http.Request, response http.ResponseWriter) error {
@@ -306,7 +379,7 @@ func setResponseFromCodes(request *http.Request, response http.ResponseWriter) e
 	}
 
 	// Choose a random "slice" from a pie
-	var totalSlices = 0
+	totalSlices := 0
 	for _, flavor := range codes {
 		totalSlices += flavor.slices
 	}
@@ -323,7 +396,7 @@ func setResponseFromCodes(request *http.Request, response http.ResponseWriter) e
 		position += flavor.slices
 	}
 
-	log.Infof("Response status code: %d", responseCode)
+	epLog.Infof("Response status code: %d", responseCode)
 	response.WriteHeader(responseCode)
 	return nil
 }

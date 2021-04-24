@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -23,8 +23,9 @@ import (
 	"strings"
 	"text/tabwriter"
 
-	adminapi "github.com/envoyproxy/go-control-plane/envoy/admin/v2alpha"
-	"github.com/envoyproxy/go-control-plane/envoy/api/v2/core"
+	adminapi "github.com/envoyproxy/go-control-plane/envoy/admin/v3"
+	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	"sigs.k8s.io/yaml"
 
 	"istio.io/istio/istioctl/pkg/util/clusters"
 	protio "istio.io/istio/istioctl/pkg/util/proto"
@@ -65,11 +66,19 @@ func (c *ConfigWriter) Prime(b []byte) error {
 }
 
 func retrieveEndpointAddress(host *adminapi.HostStatus) string {
-	return host.Address.GetSocketAddress().Address
+	addr := host.Address.GetSocketAddress()
+	if addr != nil {
+		return addr.Address
+	}
+	return "unix://" + host.Address.GetPipe().Path
 }
 
 func retrieveEndpointPort(l *adminapi.HostStatus) uint32 {
-	return l.Address.GetSocketAddress().GetPortValue()
+	addr := l.Address.GetSocketAddress()
+	if addr != nil {
+		return addr.GetPortValue()
+	}
+	return 0
 }
 
 func retrieveEndpointStatus(l *adminapi.HostStatus) core.HealthStatus {
@@ -125,7 +134,12 @@ func (c *ConfigWriter) PrintEndpointsSummary(filter EndpointFilter) error {
 	clusterEndpoint = retrieveSortedEndpointClusterSlice(clusterEndpoint)
 	fmt.Fprintln(w, "ENDPOINT\tSTATUS\tOUTLIER CHECK\tCLUSTER")
 	for _, ce := range clusterEndpoint {
-		endpoint := ce.address + ":" + strconv.Itoa(ce.port)
+		var endpoint string
+		if ce.port != 0 {
+			endpoint = ce.address + ":" + strconv.Itoa(ce.port)
+		} else {
+			endpoint = ce.address
+		}
 		fmt.Fprintf(w, "%v\t%v\t%v\t%v\n", endpoint, core.HealthStatus_name[int32(ce.status)], printFailedOutlierCheck(ce.failedOutlierCheck), ce.cluster)
 	}
 
@@ -133,7 +147,7 @@ func (c *ConfigWriter) PrintEndpointsSummary(filter EndpointFilter) error {
 }
 
 // PrintEndpoints prints the endpoints config to the ConfigWriter stdout
-func (c *ConfigWriter) PrintEndpoints(filter EndpointFilter) error {
+func (c *ConfigWriter) PrintEndpoints(filter EndpointFilter, outputFormat string) error {
 	if c.clusters == nil {
 		return fmt.Errorf("config writer has not been primed")
 	}
@@ -146,11 +160,15 @@ func (c *ConfigWriter) PrintEndpoints(filter EndpointFilter) error {
 				break
 			}
 		}
-
 	}
 	out, err := json.MarshalIndent(filteredClusters, "", "    ")
 	if err != nil {
 		return err
+	}
+	if outputFormat == "yaml" {
+		if out, err = yaml.JSONToYAML(out); err != nil {
+			return err
+		}
 	}
 	fmt.Fprintln(c.Stdout, string(out))
 	return nil

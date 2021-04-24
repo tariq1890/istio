@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -30,14 +30,17 @@ package model
 // that all handlers must be appended before starting the controller.
 type Controller interface {
 	// AppendServiceHandler notifies about changes to the service catalog.
-	AppendServiceHandler(f func(*Service, Event)) error
+	AppendServiceHandler(f func(*Service, Event))
 
-	// AppendInstanceHandler notifies about changes to the service instances
-	// for a service.
-	AppendInstanceHandler(f func(*ServiceInstance, Event)) error
+	// AppendWorkloadHandler notifies about changes to workloads. This differs from InstanceHandler,
+	// which deals with service instances (the result of a merge of Service and Workload)
+	AppendWorkloadHandler(f func(*WorkloadInstance, Event))
 
 	// Run until a signal is received
 	Run(stop <-chan struct{})
+
+	// HasSynced returns true after initial cache synchronization is complete
+	HasSynced() bool
 }
 
 // Event represents a registry update event

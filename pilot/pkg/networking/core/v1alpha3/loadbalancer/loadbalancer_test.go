@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors. All Rights Reserved.
+// Copyright Istio Authors. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,21 +18,25 @@ import (
 	"reflect"
 	"testing"
 
-	apiv2 "github.com/envoyproxy/go-control-plane/envoy/api/v2"
-	envoycore "github.com/envoyproxy/go-control-plane/envoy/api/v2/core"
-	"github.com/envoyproxy/go-control-plane/envoy/api/v2/endpoint"
+	cluster "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
+	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	endpoint "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
 	"github.com/gogo/protobuf/types"
 	. "github.com/onsi/gomega"
 
 	meshconfig "istio.io/api/mesh/v1alpha1"
 	networking "istio.io/api/networking/v1alpha3"
+	"istio.io/istio/pilot/pkg/config/memory"
 	"istio.io/istio/pilot/pkg/model"
-	"istio.io/istio/pilot/pkg/networking/core/v1alpha3/fakes"
+	memregistry "istio.io/istio/pilot/pkg/serviceregistry/memory"
 	"istio.io/istio/pkg/config"
+	"istio.io/istio/pkg/config/mesh"
+	"istio.io/istio/pkg/config/protocol"
+	"istio.io/istio/pkg/config/schema/collections"
 )
 
 func TestApplyLocalitySetting(t *testing.T) {
-	locality := &envoycore.Locality{
+	locality := &core.Locality{
 		Region:  "region1",
 		Zone:    "zone1",
 		SubZone: "subzone1",
@@ -41,12 +45,12 @@ func TestApplyLocalitySetting(t *testing.T) {
 	t.Run("Distribute", func(t *testing.T) {
 		tests := []struct {
 			name       string
-			distribute []*meshconfig.LocalityLoadBalancerSetting_Distribute
+			distribute []*networking.LocalityLoadBalancerSetting_Distribute
 			expected   []int
 		}{
 			{
 				name: "distribution between subzones",
-				distribute: []*meshconfig.LocalityLoadBalancerSetting_Distribute{
+				distribute: []*networking.LocalityLoadBalancerSetting_Distribute{
 					{
 						From: "region1/zone1/subzone1",
 						To: map[string]uint32{
@@ -63,7 +67,7 @@ func TestApplyLocalitySetting(t *testing.T) {
 			t.Run(tt.name, func(t *testing.T) {
 				env := buildEnvForClustersWithDistribute(tt.distribute)
 				cluster := buildFakeCluster()
-				ApplyLocalityLBSetting(locality, cluster.LoadAssignment, env.Mesh.LocalityLbSetting, true)
+				ApplyLocalityLBSetting(locality, cluster.LoadAssignment, env.Mesh().LocalityLbSetting, true)
 				weights := make([]int, 0)
 				for _, localityEndpoint := range cluster.LoadAssignment.Endpoints {
 					weights = append(weights, int(localityEndpoint.LoadBalancingWeight.GetValue()))
@@ -76,10 +80,10 @@ func TestApplyLocalitySetting(t *testing.T) {
 	})
 
 	t.Run("Failover: all priorities", func(t *testing.T) {
-		g := NewGomegaWithT(t)
+		g := NewWithT(t)
 		env := buildEnvForClustersWithFailover()
 		cluster := buildFakeCluster()
-		ApplyLocalityLBSetting(locality, cluster.LoadAssignment, env.Mesh.LocalityLbSetting, true)
+		ApplyLocalityLBSetting(locality, cluster.LoadAssignment, env.Mesh().LocalityLbSetting, true)
 		for _, localityEndpoint := range cluster.LoadAssignment.Endpoints {
 			if localityEndpoint.Locality.Region == locality.Region {
 				if localityEndpoint.Locality.Zone == locality.Zone {
@@ -102,10 +106,10 @@ func TestApplyLocalitySetting(t *testing.T) {
 	})
 
 	t.Run("Failover: priorities with gaps", func(t *testing.T) {
-		g := NewGomegaWithT(t)
+		g := NewWithT(t)
 		env := buildEnvForClustersWithFailover()
 		cluster := buildSmallCluster()
-		ApplyLocalityLBSetting(locality, cluster.LoadAssignment, env.Mesh.LocalityLbSetting, true)
+		ApplyLocalityLBSetting(locality, cluster.LoadAssignment, env.Mesh().LocalityLbSetting, true)
 		for _, localityEndpoint := range cluster.LoadAssignment.Endpoints {
 			if localityEndpoint.Locality.Region == locality.Region {
 				if localityEndpoint.Locality.Zone == locality.Zone {
@@ -128,10 +132,10 @@ func TestApplyLocalitySetting(t *testing.T) {
 	})
 
 	t.Run("Failover: priorities with some nil localities", func(t *testing.T) {
-		g := NewGomegaWithT(t)
+		g := NewWithT(t)
 		env := buildEnvForClustersWithFailover()
 		cluster := buildSmallClusterWithNilLocalities()
-		ApplyLocalityLBSetting(locality, cluster.LoadAssignment, env.Mesh.LocalityLbSetting, true)
+		ApplyLocalityLBSetting(locality, cluster.LoadAssignment, env.Mesh().LocalityLbSetting, true)
 		for _, localityEndpoint := range cluster.LoadAssignment.Endpoints {
 			if localityEndpoint.Locality == nil {
 				g.Expect(localityEndpoint.Priority).To(Equal(uint32(2)))
@@ -153,12 +157,90 @@ func TestApplyLocalitySetting(t *testing.T) {
 			}
 		}
 	})
+
+	t.Run("Failover: with locality lb disabled", func(t *testing.T) {
+		g := NewWithT(t)
+		cluster := buildSmallClusterWithNilLocalities()
+		lbsetting := &networking.LocalityLoadBalancerSetting{
+			Enabled: &types.BoolValue{Value: false},
+		}
+		ApplyLocalityLBSetting(locality, cluster.LoadAssignment, lbsetting, true)
+		for _, localityEndpoint := range cluster.LoadAssignment.Endpoints {
+			g.Expect(localityEndpoint.Priority).To(Equal(uint32(0)))
+		}
+	})
 }
 
-func buildEnvForClustersWithDistribute(distribute []*meshconfig.LocalityLoadBalancerSetting_Distribute) *model.Environment {
-	serviceDiscovery := &fakes.ServiceDiscovery{}
+func TestGetLocalityLbSetting(t *testing.T) {
+	// dummy config for test
+	failover := []*networking.LocalityLoadBalancerSetting_Failover{nil}
+	cases := []struct {
+		name     string
+		mesh     *networking.LocalityLoadBalancerSetting
+		dr       *networking.LocalityLoadBalancerSetting
+		expected *networking.LocalityLoadBalancerSetting
+	}{
+		{
+			"all disabled",
+			nil,
+			nil,
+			nil,
+		},
+		{
+			"mesh only",
+			&networking.LocalityLoadBalancerSetting{},
+			nil,
+			&networking.LocalityLoadBalancerSetting{},
+		},
+		{
+			"dr only",
+			nil,
+			&networking.LocalityLoadBalancerSetting{},
+			&networking.LocalityLoadBalancerSetting{},
+		},
+		{
+			"dr only override",
+			nil,
+			&networking.LocalityLoadBalancerSetting{Enabled: &types.BoolValue{Value: true}},
+			&networking.LocalityLoadBalancerSetting{Enabled: &types.BoolValue{Value: true}},
+		},
+		{
+			"both",
+			&networking.LocalityLoadBalancerSetting{},
+			&networking.LocalityLoadBalancerSetting{Failover: failover},
+			&networking.LocalityLoadBalancerSetting{Failover: failover},
+		},
+		{
+			"mesh disabled",
+			&networking.LocalityLoadBalancerSetting{Enabled: &types.BoolValue{Value: false}},
+			nil,
+			nil,
+		},
+		{
+			"dr disabled",
+			&networking.LocalityLoadBalancerSetting{Enabled: &types.BoolValue{Value: true}},
+			&networking.LocalityLoadBalancerSetting{Enabled: &types.BoolValue{Value: false}},
+			nil,
+		},
+		{
+			"dr enabled override mesh disabled",
+			&networking.LocalityLoadBalancerSetting{Enabled: &types.BoolValue{Value: false}},
+			&networking.LocalityLoadBalancerSetting{Enabled: &types.BoolValue{Value: true}},
+			&networking.LocalityLoadBalancerSetting{Enabled: &types.BoolValue{Value: true}},
+		},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			got := GetLocalityLbSetting(tt.mesh, tt.dr)
+			if !reflect.DeepEqual(tt.expected, got) {
+				t.Fatalf("Expected: %v, got: %v", tt.expected, got)
+			}
+		})
+	}
+}
 
-	serviceDiscovery.ServicesReturns([]*model.Service{
+func buildEnvForClustersWithDistribute(distribute []*networking.LocalityLoadBalancerSetting_Distribute) *model.Environment {
+	serviceDiscovery := memregistry.NewServiceDiscovery([]*model.Service{
 		{
 			Hostname:    "test.example.org",
 			Address:     "1.1.1.1",
@@ -167,56 +249,53 @@ func buildEnvForClustersWithDistribute(distribute []*meshconfig.LocalityLoadBala
 				&model.Port{
 					Name:     "default",
 					Port:     8080,
-					Protocol: config.ProtocolHTTP,
+					Protocol: protocol.HTTP,
 				},
 			},
 		},
-	}, nil)
+	})
 
 	meshConfig := &meshconfig.MeshConfig{
 		ConnectTimeout: &types.Duration{
 			Seconds: 10,
 			Nanos:   1,
 		},
-		LocalityLbSetting: &meshconfig.LocalityLoadBalancerSetting{
+		LocalityLbSetting: &networking.LocalityLoadBalancerSetting{
 			Distribute: distribute,
 		},
 	}
 
-	configStore := &fakes.IstioConfigStore{}
+	configStore := model.MakeIstioStore(memory.Make(collections.Pilot))
 
 	env := &model.Environment{
 		ServiceDiscovery: serviceDiscovery,
 		IstioConfigStore: configStore,
-		Mesh:             meshConfig,
-		MixerSAN:         []string{},
+		Watcher:          mesh.NewFixedWatcher(meshConfig),
 	}
 
 	env.PushContext = model.NewPushContext()
-	_ = env.PushContext.InitContext(env)
-	env.PushContext.SetDestinationRules([]model.Config{
-		{ConfigMeta: model.ConfigMeta{
-			Type:    model.DestinationRule.Type,
-			Version: model.DestinationRule.Version,
-			Name:    "acme",
-		},
+	env.Init()
+	_ = env.PushContext.InitContext(env, nil, nil)
+	env.PushContext.SetDestinationRules([]config.Config{
+		{
+			Meta: config.Meta{
+				GroupVersionKind: collections.IstioNetworkingV1Alpha3Destinationrules.Resource().GroupVersionKind(),
+				Name:             "acme",
+			},
 			Spec: &networking.DestinationRule{
 				Host: "test.example.org",
 				TrafficPolicy: &networking.TrafficPolicy{
-					OutlierDetection: &networking.OutlierDetection{
-						ConsecutiveErrors: 5,
-					},
+					OutlierDetection: &networking.OutlierDetection{},
 				},
 			},
-		}})
+		},
+	})
 
 	return env
 }
 
 func buildEnvForClustersWithFailover() *model.Environment {
-	serviceDiscovery := &fakes.ServiceDiscovery{}
-
-	serviceDiscovery.ServicesReturns([]*model.Service{
+	serviceDiscovery := memregistry.NewServiceDiscovery([]*model.Service{
 		{
 			Hostname:    "test.example.org",
 			Address:     "1.1.1.1",
@@ -225,19 +304,19 @@ func buildEnvForClustersWithFailover() *model.Environment {
 				&model.Port{
 					Name:     "default",
 					Port:     8080,
-					Protocol: config.ProtocolHTTP,
+					Protocol: protocol.HTTP,
 				},
 			},
 		},
-	}, nil)
+	})
 
 	meshConfig := &meshconfig.MeshConfig{
 		ConnectTimeout: &types.Duration{
 			Seconds: 10,
 			Nanos:   1,
 		},
-		LocalityLbSetting: &meshconfig.LocalityLoadBalancerSetting{
-			Failover: []*meshconfig.LocalityLoadBalancerSetting_Failover{
+		LocalityLbSetting: &networking.LocalityLoadBalancerSetting{
+			Failover: []*networking.LocalityLoadBalancerSetting_Failover{
 				{
 					From: "region1",
 					To:   "region2",
@@ -246,86 +325,85 @@ func buildEnvForClustersWithFailover() *model.Environment {
 		},
 	}
 
-	configStore := &fakes.IstioConfigStore{}
+	configStore := model.MakeIstioStore(memory.Make(collections.Pilot))
 
 	env := &model.Environment{
 		ServiceDiscovery: serviceDiscovery,
 		IstioConfigStore: configStore,
-		Mesh:             meshConfig,
-		MixerSAN:         []string{},
+		Watcher:          mesh.NewFixedWatcher(meshConfig),
 	}
 
 	env.PushContext = model.NewPushContext()
-	_ = env.PushContext.InitContext(env)
-	env.PushContext.SetDestinationRules([]model.Config{
-		{ConfigMeta: model.ConfigMeta{
-			Type:    model.DestinationRule.Type,
-			Version: model.DestinationRule.Version,
-			Name:    "acme",
-		},
+	env.Init()
+	_ = env.PushContext.InitContext(env, nil, nil)
+	env.PushContext.SetDestinationRules([]config.Config{
+		{
+			Meta: config.Meta{
+				GroupVersionKind: collections.IstioNetworkingV1Alpha3Destinationrules.Resource().GroupVersionKind(),
+				Name:             "acme",
+			},
 			Spec: &networking.DestinationRule{
 				Host: "test.example.org",
 				TrafficPolicy: &networking.TrafficPolicy{
-					OutlierDetection: &networking.OutlierDetection{
-						ConsecutiveErrors: 5,
-					},
+					OutlierDetection: &networking.OutlierDetection{},
 				},
 			},
-		}})
+		},
+	})
 
 	return env
 }
 
-func buildFakeCluster() *apiv2.Cluster {
-	return &apiv2.Cluster{
+func buildFakeCluster() *cluster.Cluster {
+	return &cluster.Cluster{
 		Name: "outbound|8080||test.example.org",
-		LoadAssignment: &apiv2.ClusterLoadAssignment{
+		LoadAssignment: &endpoint.ClusterLoadAssignment{
 			ClusterName: "outbound|8080||test.example.org",
-			Endpoints: []endpoint.LocalityLbEndpoints{
+			Endpoints: []*endpoint.LocalityLbEndpoints{
 				{
-					Locality: &envoycore.Locality{
+					Locality: &core.Locality{
 						Region:  "region1",
 						Zone:    "zone1",
 						SubZone: "subzone1",
 					},
 				},
 				{
-					Locality: &envoycore.Locality{
+					Locality: &core.Locality{
 						Region:  "region1",
 						Zone:    "zone1",
 						SubZone: "subzone1",
 					},
 				},
 				{
-					Locality: &envoycore.Locality{
+					Locality: &core.Locality{
 						Region:  "region1",
 						Zone:    "zone1",
 						SubZone: "subzone2",
 					},
 				},
 				{
-					Locality: &envoycore.Locality{
+					Locality: &core.Locality{
 						Region:  "region1",
 						Zone:    "zone1",
 						SubZone: "subzone3",
 					},
 				},
 				{
-					Locality: &envoycore.Locality{
+					Locality: &core.Locality{
 						Region:  "region1",
 						Zone:    "zone2",
 						SubZone: "",
 					},
 				},
 				{
-					Locality: &envoycore.Locality{
+					Locality: &core.Locality{
 						Region:  "region2",
 						Zone:    "",
 						SubZone: "",
 					},
 				},
 				{
-					Locality: &envoycore.Locality{
+					Locality: &core.Locality{
 						Region:  "region3",
 						Zone:    "",
 						SubZone: "",
@@ -334,31 +412,30 @@ func buildFakeCluster() *apiv2.Cluster {
 			},
 		},
 	}
-
 }
 
-func buildSmallCluster() *apiv2.Cluster {
-	return &apiv2.Cluster{
+func buildSmallCluster() *cluster.Cluster {
+	return &cluster.Cluster{
 		Name: "outbound|8080||test.example.org",
-		LoadAssignment: &apiv2.ClusterLoadAssignment{
+		LoadAssignment: &endpoint.ClusterLoadAssignment{
 			ClusterName: "outbound|8080||test.example.org",
-			Endpoints: []endpoint.LocalityLbEndpoints{
+			Endpoints: []*endpoint.LocalityLbEndpoints{
 				{
-					Locality: &envoycore.Locality{
+					Locality: &core.Locality{
 						Region:  "region1",
 						Zone:    "zone1",
 						SubZone: "subzone2",
 					},
 				},
 				{
-					Locality: &envoycore.Locality{
+					Locality: &core.Locality{
 						Region:  "region2",
 						Zone:    "zone1",
 						SubZone: "subzone2",
 					},
 				},
 				{
-					Locality: &envoycore.Locality{
+					Locality: &core.Locality{
 						Region:  "region2",
 						Zone:    "zone1",
 						SubZone: "subzone2",
@@ -369,14 +446,14 @@ func buildSmallCluster() *apiv2.Cluster {
 	}
 }
 
-func buildSmallClusterWithNilLocalities() *apiv2.Cluster {
-	return &apiv2.Cluster{
+func buildSmallClusterWithNilLocalities() *cluster.Cluster {
+	return &cluster.Cluster{
 		Name: "outbound|8080||test.example.org",
-		LoadAssignment: &apiv2.ClusterLoadAssignment{
+		LoadAssignment: &endpoint.ClusterLoadAssignment{
 			ClusterName: "outbound|8080||test.example.org",
-			Endpoints: []endpoint.LocalityLbEndpoints{
+			Endpoints: []*endpoint.LocalityLbEndpoints{
 				{
-					Locality: &envoycore.Locality{
+					Locality: &core.Locality{
 						Region:  "region1",
 						Zone:    "zone1",
 						SubZone: "subzone2",
@@ -384,7 +461,7 @@ func buildSmallClusterWithNilLocalities() *apiv2.Cluster {
 				},
 				{},
 				{
-					Locality: &envoycore.Locality{
+					Locality: &core.Locality{
 						Region:  "region2",
 						Zone:    "zone1",
 						SubZone: "subzone2",

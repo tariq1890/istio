@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,9 +19,9 @@ import (
 	"reflect"
 	"strings"
 
-	adminapi "github.com/envoyproxy/go-control-plane/envoy/admin/v2alpha"
-	"github.com/gogo/protobuf/jsonpb"
-	proto "github.com/gogo/protobuf/proto"
+	adminapi "github.com/envoyproxy/go-control-plane/envoy/admin/v3"
+	"github.com/golang/protobuf/jsonpb"
+	"github.com/golang/protobuf/proto"
 	emptypb "github.com/golang/protobuf/ptypes/empty"
 	exprpb "google.golang.org/genproto/googleapis/api/expr/v1alpha1"
 )
@@ -29,9 +29,7 @@ import (
 // nonstrictResolver is an AnyResolver that ignores unknown proto messages
 type nonstrictResolver struct{}
 
-var (
-	envoyResolver nonstrictResolver
-)
+var envoyResolver nonstrictResolver
 
 func (m *nonstrictResolver) Resolve(typeURL string) (proto.Message, error) {
 	// See https://github.com/golang/protobuf/issues/747#issuecomment-437463120
@@ -39,6 +37,7 @@ func (m *nonstrictResolver) Resolve(typeURL string) (proto.Message, error) {
 	if slash := strings.LastIndex(typeURL, "/"); slash >= 0 {
 		mname = mname[slash+1:]
 	}
+	// nolint: staticcheck
 	mt := proto.MessageType(mname)
 	if mt == nil {
 		// istioctl should keep going if it encounters new Envoy versions; ignore unknown types
@@ -66,8 +65,10 @@ func (w *Wrapper) MarshalJSON() ([]byte, error) {
 // UnmarshalJSON is a custom unmarshaller to handle protobuf pain
 func (w *Wrapper) UnmarshalJSON(b []byte) error {
 	cd := &adminapi.ConfigDump{}
-	err := (&jsonpb.Unmarshaler{AllowUnknownFields: true,
-		AnyResolver: &envoyResolver}).Unmarshal(bytes.NewReader(b), cd)
+	err := (&jsonpb.Unmarshaler{
+		AllowUnknownFields: true,
+		AnyResolver:        &envoyResolver,
+	}).Unmarshal(bytes.NewReader(b), cd)
 	*w = Wrapper{cd}
 	return err
 }

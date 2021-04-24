@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,35 +15,45 @@
 package mock
 
 import (
-	"time"
-
 	"istio.io/istio/security/pkg/pki/ca"
+	caerror "istio.io/istio/security/pkg/pki/error"
 	"istio.io/istio/security/pkg/pki/util"
-	"istio.io/istio/security/pkg/pki/util/mock"
 )
 
 // FakeCA is a mock of CertificateAuthority.
 type FakeCA struct {
 	SignedCert    []byte
-	SignErr       *ca.Error
-	KeyCertBundle util.KeyCertBundle
+	SignErr       *caerror.Error
+	KeyCertBundle *util.KeyCertBundle
 	ReceivedIDs   []string
 }
 
 // Sign returns the SignErr if SignErr is not nil, otherwise, it returns SignedCert.
-func (ca *FakeCA) Sign(csr []byte, identities []string, lifetime time.Duration, forCA bool) ([]byte, error) {
-	ca.ReceivedIDs = identities
+func (ca *FakeCA) Sign(csr []byte, certOpts ca.CertOpts) ([]byte, error) {
+	ca.ReceivedIDs = certOpts.SubjectIDs
 	if ca.SignErr != nil {
 		return nil, ca.SignErr
 	}
 	return ca.SignedCert, nil
 }
 
+// SignWithCertChain returns the SignErr if SignErr is not nil, otherwise, it returns SignedCert and the cert chain.
+func (ca *FakeCA) SignWithCertChain(csr []byte, certOpts ca.CertOpts) ([]byte, error) {
+	if ca.SignErr != nil {
+		return nil, ca.SignErr
+	}
+	cert := ca.SignedCert
+	if ca.KeyCertBundle != nil {
+		cert = append(cert, ca.KeyCertBundle.GetCertChainPem()...)
+	}
+	return cert, nil
+}
+
 // GetCAKeyCertBundle returns KeyCertBundle if KeyCertBundle is not nil, otherwise, it returns an empty
 // FakeKeyCertBundle.
-func (ca *FakeCA) GetCAKeyCertBundle() util.KeyCertBundle {
+func (ca *FakeCA) GetCAKeyCertBundle() *util.KeyCertBundle {
 	if ca.KeyCertBundle == nil {
-		return &mock.FakeKeyCertBundle{}
+		return util.NewKeyCertBundleFromPem([]byte{}, []byte("foo"), []byte("fake"), []byte("fake"))
 	}
 	return ca.KeyCertBundle
 }

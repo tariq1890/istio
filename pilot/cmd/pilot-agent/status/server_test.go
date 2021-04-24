@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,25 +16,54 @@ package status
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/signal"
+	"reflect"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/prometheus/common/expfmt"
+	"k8s.io/apimachinery/pkg/util/intstr"
+
+	"istio.io/istio/pilot/cmd/pilot-agent/status/ready"
+	"istio.io/istio/pilot/cmd/pilot-agent/status/testserver"
+	"istio.io/istio/pkg/kube/apimirror"
 	"istio.io/istio/pkg/test/env"
+	"istio.io/istio/pkg/test/util/retry"
+	"istio.io/pkg/log"
 )
 
 type handler struct{}
 
+const (
+	testHeader      = "Some-Header"
+	testHeaderValue = "some-value"
+	testHostValue   = "host"
+)
+
+var liveServerStats = "cluster_manager.cds.update_success: 1\nlistener_manager.lds.update_success: 1\nserver.state: 0\nlistener_manager.workers_started: 1"
+
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/header" {
+		if r.Host != testHostValue {
+			log.Errorf("Missing expected host header, got %v", r.Host)
+			w.WriteHeader(http.StatusBadRequest)
+		}
+		if r.Header.Get(testHeader) != testHeaderValue {
+			log.Errorf("Missing expected Some-Header, got %v", r.Header)
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}
 	if r.URL.Path != "/hello/sunnyvale" && r.URL.Path != "/" {
-		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
 	w.Write([]byte("welcome, it works"))
@@ -42,57 +71,289 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func TestNewServer(t *testing.T) {
 	testCases := []struct {
-		httpProbe string
-		err       string
+		probe string
+		err   string
 	}{
 		// Json can't be parsed.
 		{
-			httpProbe: "invalid-prober-json-encoding",
-			err:       "failed to decode",
+			probe: "invalid-prober-json-encoding",
+			err:   "failed to decode",
 		},
 		// map key is not well formed.
 		{
-			httpProbe: `{"abc": {"path": "/app-foo/health"}}`,
-			err:       "invalid key",
+			probe: `{"abc": {"path": "/app-foo/health"}}`,
+			err:   "invalid key",
+		},
+		// invalid probe type
+		{
+			probe: `{"/app-health/hello-world/readyz": {"tcpSocket": {"port": "8888"}}}`,
+			err:   "invalid prober type",
 		},
 		// Port is not Int typed.
 		{
-			httpProbe: `{"/app-health/hello-world/readyz": {"path": "/hello/sunnyvale", "port": "container-port-dontknow"}}`,
-			err:       "must be int type",
+			probe: `{"/app-health/hello-world/readyz": {"httpGet": {"path": "/hello/sunnyvale", "port": "container-port-dontknow"}}}`,
+			err:   "must be int type",
 		},
 		// A valid input.
 		{
-			httpProbe: `{"/app-health/hello-world/readyz": {"path": "/hello/sunnyvale", "port": 8080},` +
-				`"/app-health/business/livez": {"path": "/buisiness/live", "port": 9090}}`,
+			probe: `{"/app-health/hello-world/readyz": {"httpGet": {"path": "/hello/sunnyvale", "port": 8080}},` +
+				`"/app-health/business/livez": {"httpGet": {"path": "/buisiness/live", "port": 9090}}}`,
+		},
+		// long request timeout
+		{
+			probe: `{"/app-health/hello-world/readyz": {"httpGet": {"path": "/hello/sunnyvale", "port": 8080},` +
+				`"initialDelaySeconds": 120,"timeoutSeconds": 10,"periodSeconds": 20}}`,
 		},
 		// A valid input with empty probing path, which happens when HTTPGetAction.Path is not specified.
 		{
-			httpProbe: `{"/app-health/hello-world/readyz": {"path": "/hello/sunnyvale", "port": 8080},
-"/app-health/business/livez": {"port": 9090}}`,
+			probe: `{"/app-health/hello-world/readyz": {"httpGet": {"path": "/hello/sunnyvale", "port": 8080}},
+"/app-health/business/livez": {"httpGet": {"port": 9090}}}`,
 		},
 		// A valid input without any prober info.
 		{
-			httpProbe: `{}`,
+			probe: `{}`,
+		},
+		// A valid input with probing path not starting with /, which happens when HTTPGetAction.Path does not start with a /.
+		{
+			probe: `{"/app-health/hello-world/readyz": {"httpGet": {"path": "hello/sunnyvale", "port": 8080}},
+"/app-health/business/livez": {"httpGet": {"port": 9090}}}`,
 		},
 	}
 	for _, tc := range testCases {
-		_, err := NewServer(Config{
-			KubeAppHTTPProbers: tc.httpProbe,
+		_, err := NewServer(Options{
+			KubeAppProbers: tc.probe,
 		})
 
 		if err == nil {
 			if tc.err != "" {
-				t.Errorf("test case failed [%v], expect error %v", tc.httpProbe, tc.err)
+				t.Errorf("test case failed [%v], expect error %v", tc.probe, tc.err)
 			}
 			continue
 		}
 		if tc.err == "" {
-			t.Errorf("test case failed [%v], expect no error, got %v", tc.httpProbe, err)
+			t.Errorf("test case failed [%v], expect no error, got %v", tc.probe, err)
 		}
 		// error case, error string should match.
 		if !strings.Contains(err.Error(), tc.err) {
-			t.Errorf("test case failed [%v], expect error %v, got %v", tc.httpProbe, tc.err, err)
+			t.Errorf("test case failed [%v], expect error %v, got %v", tc.probe, tc.err, err)
 		}
+	}
+}
+
+func TestPprof(t *testing.T) {
+	pprofPath := "/debug/pprof/cmdline"
+	// Starts the pilot agent status server.
+	server, err := NewServer(Options{StatusPort: 0})
+	if err != nil {
+		t.Fatalf("failed to create status server %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go server.Run(ctx)
+
+	var statusPort uint16
+	for statusPort == 0 {
+		server.mutex.RLock()
+		statusPort = server.statusPort
+		server.mutex.RUnlock()
+	}
+
+	client := http.Client{}
+	req, err := http.NewRequest("GET", fmt.Sprintf("http://localhost:%v/%s", statusPort, pprofPath), nil)
+	if err != nil {
+		t.Fatalf("[%v] failed to create request", pprofPath)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal("request failed: ", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("[%v] unexpected status code, want = %v, got = %v", pprofPath, http.StatusOK, resp.StatusCode)
+	}
+}
+
+func TestStats(t *testing.T) {
+	cases := []struct {
+		name             string
+		envoy            string
+		app              string
+		output           string
+		expectParseError bool
+	}{
+		{
+			name: "envoy metric only",
+			envoy: `# TYPE my_metric counter
+my_metric{} 0
+# TYPE my_other_metric counter
+my_other_metric{} 0
+`,
+			output: `# TYPE my_metric counter
+my_metric{} 0
+# TYPE my_other_metric counter
+my_other_metric{} 0
+`,
+		},
+		{
+			name: "app metric only",
+			app: `# TYPE my_metric counter
+my_metric{} 0
+# TYPE my_other_metric counter
+my_other_metric{} 0
+`,
+			output: `# TYPE my_metric counter
+my_metric{} 0
+# TYPE my_other_metric counter
+my_other_metric{} 0
+`,
+		},
+		{
+			name: "multiple metric",
+			envoy: `# TYPE my_metric counter
+my_metric{} 0
+`,
+			app: `# TYPE my_other_metric counter
+my_other_metric{} 0
+`,
+			output: `# TYPE my_metric counter
+my_metric{} 0
+# TYPE my_other_metric counter
+my_other_metric{} 0
+`,
+		},
+		{
+			name:  "agent metric",
+			envoy: ``,
+			app:   ``,
+			// Agent metric is dynamic, so we just check a substring of it not the actual metric
+			output: `
+# TYPE istio_agent_scrapes_total counter
+istio_agent_scrapes_total`,
+		},
+		// When the application and envoy share a metric, Prometheus will fail. This negative check validates this
+		// assumption.
+		{
+			name: "conflict metric",
+			envoy: `# TYPE my_metric counter
+my_metric{} 0
+# TYPE my_other_metric counter
+my_other_metric{} 0
+`,
+			app: `# TYPE my_metric counter
+my_metric{} 0
+`,
+			output: `# TYPE my_metric counter
+my_metric{} 0
+# TYPE my_other_metric counter
+my_other_metric{} 0
+# TYPE my_metric counter
+my_metric{} 0
+`,
+			expectParseError: true,
+		},
+		{
+			name: "conflict metric labeled",
+			envoy: `# TYPE my_metric counter
+my_metric{app="foo"} 0
+`,
+			app: `# TYPE my_metric counter
+my_metric{app="bar"} 0
+`,
+			output: `# TYPE my_metric counter
+my_metric{app="foo"} 0
+# TYPE my_metric counter
+my_metric{app="bar"} 0
+`,
+			expectParseError: true,
+		},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			envoy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if _, err := w.Write([]byte(tt.envoy)); err != nil {
+					t.Fatalf("write failed: %v", err)
+				}
+			}))
+			defer envoy.Close()
+			app := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if _, err := w.Write([]byte(tt.app)); err != nil {
+					t.Fatalf("write failed: %v", err)
+				}
+			}))
+			defer app.Close()
+			envoyPort, err := strconv.Atoi(strings.Split(envoy.URL, ":")[2])
+			if err != nil {
+				t.Fatal(err)
+			}
+			server := &Server{
+				prometheus: &PrometheusScrapeConfiguration{
+					Port: strings.Split(app.URL, ":")[2],
+				},
+				envoyStatsPort: envoyPort,
+			}
+			req := &http.Request{}
+			server.handleStats(rec, req)
+			if rec.Code != 200 {
+				t.Fatalf("handleStats() => %v; want 200", rec.Code)
+			}
+			if !strings.Contains(rec.Body.String(), tt.output) {
+				t.Fatalf("handleStats() => %v; want %v", rec.Body.String(), tt.output)
+			}
+
+			parser := expfmt.TextParser{}
+			mfMap, err := parser.TextToMetricFamilies(strings.NewReader(rec.Body.String()))
+			if err != nil && !tt.expectParseError {
+				t.Fatalf("failed to parse metrics: %v", err)
+			} else if err == nil && tt.expectParseError {
+				t.Fatalf("expected a prse error, got %+v", mfMap)
+			}
+		})
+	}
+}
+
+func TestStatsError(t *testing.T) {
+	fail := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer fail.Close()
+	pass := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer pass.Close()
+	failPort, err := strconv.Atoi(strings.Split(fail.URL, ":")[2])
+	if err != nil {
+		t.Fatal(err)
+	}
+	passPort, err := strconv.Atoi(strings.Split(pass.URL, ":")[2])
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name  string
+		envoy int
+		app   int
+	}{
+		{"both pass", passPort, passPort},
+		{"envoy pass", passPort, failPort},
+		{"app pass", failPort, passPort},
+		{"both fail", failPort, failPort},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			server := &Server{
+				prometheus: &PrometheusScrapeConfiguration{
+					Port: strconv.Itoa(tt.app),
+				},
+				envoyStatsPort: tt.envoy,
+			}
+			req := &http.Request{}
+			rec := httptest.NewRecorder()
+			server.handleStats(rec, req)
+			if rec.Code != 200 {
+				t.Fatalf("handleStats() => %v; want 200", rec.Code)
+			}
+		})
 	}
 }
 
@@ -105,56 +366,121 @@ func TestAppProbe(t *testing.T) {
 	go http.Serve(listener, &handler{})
 	appPort := listener.Addr().(*net.TCPAddr).Port
 
-	// Starts the pilot agent status server.
-	server, err := NewServer(Config{
-		StatusPort: 0,
-		KubeAppHTTPProbers: fmt.Sprintf(`{"/app-health/hello-world/readyz": {"path": "/hello/sunnyvale", "port": %v},
-"/app-health/hello-world/livez": {"port": %v}}`, appPort, appPort),
-	})
-	if err != nil {
-		t.Errorf("failed to create status server %v", err)
-		return
+	simpleConfig := KubeAppProbers{
+		"/app-health/hello-world/readyz": &Prober{
+			HTTPGet: &apimirror.HTTPGetAction{
+				Path: "/hello/sunnyvale",
+				Port: intstr.IntOrString{IntVal: int32(appPort)},
+			},
+		},
+		"/app-health/hello-world/livez": &Prober{
+			HTTPGet: &apimirror.HTTPGetAction{
+				Port: intstr.IntOrString{IntVal: int32(appPort)},
+			},
+		},
 	}
-	go server.Run(context.Background())
 
-	// We wait a bit here to ensure server's statusPort is updated.
-	time.Sleep(time.Second * 3)
-
-	server.mutex.RLock()
-	statusPort := server.statusPort
-	server.mutex.RUnlock()
-	t.Logf("status server starts at port %v, app starts at port %v", statusPort, appPort)
 	testCases := []struct {
 		probePath  string
+		config     KubeAppProbers
 		statusCode int
 	}{
 		{
-			probePath:  fmt.Sprintf(":%v/bad-path-should-be-404", statusPort),
+			probePath:  "bad-path-should-be-404",
+			config:     simpleConfig,
 			statusCode: http.StatusNotFound,
 		},
 		{
-			probePath:  fmt.Sprintf(":%v/app-health/hello-world/readyz", statusPort),
+			probePath:  "app-health/hello-world/readyz",
+			config:     simpleConfig,
 			statusCode: http.StatusOK,
 		},
 		{
-			probePath:  fmt.Sprintf(":%v/app-health/hello-world/livez", statusPort),
+			probePath:  "app-health/hello-world/livez",
+			config:     simpleConfig,
+			statusCode: http.StatusOK,
+		},
+		{
+			probePath: "app-health/header/readyz",
+			config: KubeAppProbers{
+				"/app-health/header/readyz": &Prober{
+					HTTPGet: &apimirror.HTTPGetAction{
+						Port: intstr.IntOrString{IntVal: int32(appPort)},
+						Path: "/header",
+						HTTPHeaders: []apimirror.HTTPHeader{
+							{"Host", testHostValue},
+							{testHeader, testHeaderValue},
+						},
+					},
+				},
+			},
+			statusCode: http.StatusOK,
+		},
+		{
+			probePath: "app-health/hello-world/readyz",
+			config: KubeAppProbers{
+				"/app-health/hello-world/readyz": &Prober{
+					HTTPGet: &apimirror.HTTPGetAction{
+						Path: "hello/texas",
+						Port: intstr.IntOrString{IntVal: int32(appPort)},
+					},
+				},
+			},
+			statusCode: http.StatusOK,
+		},
+		{
+			probePath: "app-health/hello-world/livez",
+			config: KubeAppProbers{
+				"/app-health/hello-world/livez": &Prober{
+					HTTPGet: &apimirror.HTTPGetAction{
+						Path: "hello/texas",
+						Port: intstr.IntOrString{IntVal: int32(appPort)},
+					},
+				},
+			},
 			statusCode: http.StatusOK,
 		},
 	}
 	for _, tc := range testCases {
-		client := http.Client{}
-		req, err := http.NewRequest("GET", fmt.Sprintf("http://localhost%s", tc.probePath), nil)
-		if err != nil {
-			t.Errorf("[%v] failed to create request", tc.probePath)
-		}
-		resp, err := client.Do(req)
-		if err != nil {
-			t.Fatal("request failed")
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode != tc.statusCode {
-			t.Errorf("[%v] unexpected status code, want = %v, got = %v", tc.probePath, tc.statusCode, resp.StatusCode)
-		}
+		t.Run(tc.probePath, func(t *testing.T) {
+			appProber, err := json.Marshal(tc.config)
+			if err != nil {
+				t.Fatalf("invalid app probers")
+			}
+			config := Options{
+				StatusPort:     0,
+				KubeAppProbers: string(appProber),
+			}
+			// Starts the pilot agent status server.
+			server, err := NewServer(config)
+			if err != nil {
+				t.Fatalf("failed to create status server %v", err)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			go server.Run(ctx)
+
+			var statusPort uint16
+			for statusPort == 0 {
+				server.mutex.RLock()
+				statusPort = server.statusPort
+				server.mutex.RUnlock()
+			}
+
+			client := http.Client{}
+			req, err := http.NewRequest("GET", fmt.Sprintf("http://localhost:%v/%s", statusPort, tc.probePath), nil)
+			if err != nil {
+				t.Fatalf("[%v] failed to create request", tc.probePath)
+			}
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatal("request failed: ", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != tc.statusCode {
+				t.Errorf("[%v] unexpected status code, want = %v, got = %v", tc.probePath, tc.statusCode, resp.StatusCode)
+			}
+		})
 	}
 }
 
@@ -170,10 +496,10 @@ func TestHttpsAppProbe(t *testing.T) {
 	appPort := listener.Addr().(*net.TCPAddr).Port
 
 	// Starts the pilot agent status server.
-	server, err := NewServer(Config{
+	server, err := NewServer(Options{
 		StatusPort: 0,
-		KubeAppHTTPProbers: fmt.Sprintf(`{"/app-health/hello-world/readyz": {"path": "/hello/sunnyvale", "port": %v, "scheme": "HTTPS"},
-"/app-health/hello-world/livez": {"port": %v, "scheme": "HTTPS"}}`, appPort, appPort),
+		KubeAppProbers: fmt.Sprintf(`{"/app-health/hello-world/readyz": {"httpGet": {"path": "/hello/sunnyvale", "port": %v, "scheme": "HTTPS"}},
+"/app-health/hello-world/livez": {"httpGet": {"port": %v, "scheme": "HTTPS"}}}`, appPort, appPort),
 	})
 	if err != nil {
 		t.Errorf("failed to create status server %v", err)
@@ -181,12 +507,18 @@ func TestHttpsAppProbe(t *testing.T) {
 	}
 	go server.Run(context.Background())
 
-	// We wait a bit here to ensure server's statusPort is updated.
-	time.Sleep(time.Second * 3)
-
-	server.mutex.RLock()
-	statusPort := server.statusPort
-	server.mutex.RUnlock()
+	var statusPort uint16
+	if err := retry.UntilSuccess(func() error {
+		server.mutex.RLock()
+		statusPort = server.statusPort
+		server.mutex.RUnlock()
+		if statusPort == 0 {
+			return fmt.Errorf("no port allocated")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("failed to getport: %v", err)
+	}
 	t.Logf("status server starts at port %v, app starts at port %v", statusPort, appPort)
 	testCases := []struct {
 		probePath  string
@@ -222,9 +554,157 @@ func TestHttpsAppProbe(t *testing.T) {
 	}
 }
 
+func TestProbeHeader(t *testing.T) {
+	headerChecker := func(t *testing.T, header http.Header) net.Listener {
+		listener, err := net.Listen("tcp", ":0")
+		if err != nil {
+			t.Fatalf("failed to allocate unused port %v", err)
+		}
+		go http.Serve(listener, http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+			r.Header.Del("User-Agent")
+			r.Header.Del("Accept-Encoding")
+			if !reflect.DeepEqual(r.Header, header) {
+				t.Errorf("unexpected header, want = %v, got = %v", header, r.Header)
+				http.Error(rw, "", http.StatusBadRequest)
+				return
+			}
+			http.Error(rw, "", http.StatusOK)
+		}))
+		return listener
+	}
+
+	testCases := []struct {
+		name          string
+		originHeaders http.Header
+		proxyHeaders  []apimirror.HTTPHeader
+		want          http.Header
+	}{
+		{
+			name: "Only Origin",
+			originHeaders: http.Header{
+				testHeader: []string{testHeaderValue},
+			},
+			proxyHeaders: []apimirror.HTTPHeader{},
+			want: http.Header{
+				testHeader: []string{testHeaderValue},
+			},
+		},
+		{
+			name: "Only Origin, has multiple values",
+			originHeaders: http.Header{
+				testHeader: []string{testHeaderValue, testHeaderValue},
+			},
+			proxyHeaders: []apimirror.HTTPHeader{},
+			want: http.Header{
+				testHeader: []string{testHeaderValue, testHeaderValue},
+			},
+		},
+		{
+			name:          "Only Proxy",
+			originHeaders: http.Header{},
+			proxyHeaders: []apimirror.HTTPHeader{
+				{
+					Name:  testHeader,
+					Value: testHeaderValue,
+				},
+			},
+			want: http.Header{
+				testHeader: []string{testHeaderValue},
+			},
+		},
+		{
+			name:          "Only Proxy, has multiple values",
+			originHeaders: http.Header{},
+			proxyHeaders: []apimirror.HTTPHeader{
+				{
+					Name:  testHeader,
+					Value: testHeaderValue,
+				},
+				{
+					Name:  testHeader,
+					Value: testHeaderValue,
+				},
+			},
+			want: http.Header{
+				testHeader: []string{testHeaderValue, testHeaderValue},
+			},
+		},
+		{
+			name: "Proxy overwrites Origin",
+			originHeaders: http.Header{
+				testHeader: []string{testHeaderValue, testHeaderValue},
+			},
+			proxyHeaders: []apimirror.HTTPHeader{
+				{
+					Name:  testHeader,
+					Value: testHeaderValue + "Over",
+				},
+			},
+			want: http.Header{
+				testHeader: []string{testHeaderValue + "Over"},
+			},
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := headerChecker(t, tc.want)
+			defer svc.Close()
+			probePath := "/app-health/hello-world/livez"
+			appAddress := svc.Addr().(*net.TCPAddr)
+			appProber, err := json.Marshal(KubeAppProbers{
+				probePath: &Prober{
+					HTTPGet: &apimirror.HTTPGetAction{
+						Port:        intstr.IntOrString{IntVal: int32(appAddress.Port)},
+						Host:        appAddress.IP.String(),
+						Path:        "/header",
+						HTTPHeaders: tc.proxyHeaders,
+					},
+				},
+			})
+			if err != nil {
+				t.Fatalf("invalid app probers")
+			}
+			config := Options{
+				StatusPort:     0,
+				KubeAppProbers: string(appProber),
+			}
+			// Starts the pilot agent status server.
+			server, err := NewServer(config)
+			if err != nil {
+				t.Fatal("failed to create status server: ", err)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			go server.Run(ctx)
+
+			var statusPort uint16
+			for statusPort == 0 {
+				server.mutex.RLock()
+				statusPort = server.statusPort
+				server.mutex.RUnlock()
+			}
+
+			client := http.Client{}
+			req, err := http.NewRequest("GET", fmt.Sprintf("http://localhost:%v%s", statusPort, probePath), nil)
+			if err != nil {
+				t.Fatal("failed to create request: ", err)
+			}
+			req.Header = tc.originHeaders
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatal("request failed: ", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Errorf("unexpected status code, want = %v, got = %v", http.StatusOK, resp.StatusCode)
+			}
+		})
+	}
+}
+
 func TestHandleQuit(t *testing.T) {
 	statusPort := 15020
-	s, err := NewServer(Config{StatusPort: uint16(statusPort)})
+	s, err := NewServer(Options{StatusPort: uint16(statusPort)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -293,4 +773,64 @@ func TestHandleQuit(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestAdditionalProbes(t *testing.T) {
+	rp := readyProbe{}
+	urp := unreadyProbe{}
+	testCases := []struct {
+		name   string
+		probes []ready.Prober
+		err    error
+	}{
+		{
+			name:   "success probe",
+			probes: []ready.Prober{rp},
+			err:    nil,
+		},
+		{
+			name:   "not ready probe",
+			probes: []ready.Prober{urp},
+			err:    errors.New("not ready"),
+		},
+		{
+			name:   "both probes",
+			probes: []ready.Prober{rp, urp},
+			err:    errors.New("not ready"),
+		},
+	}
+	testServer := testserver.CreateAndStartServer(liveServerStats)
+	defer testServer.Close()
+	for _, tc := range testCases {
+		server, err := NewServer(Options{
+			Probes:    tc.probes,
+			AdminPort: uint16(testServer.Listener.Addr().(*net.TCPAddr).Port),
+		})
+		if err != nil {
+			t.Errorf("failed to construct server")
+		}
+		err = server.isReady()
+		if tc.err == nil {
+			if err != nil {
+				t.Errorf("Unexpected result, expected: %v got: %v", tc.err, err)
+			}
+		} else {
+			if err.Error() != tc.err.Error() {
+				t.Errorf("Unexpected result, expected: %v got: %v", tc.err, err)
+			}
+		}
+
+	}
+}
+
+type readyProbe struct{}
+
+func (s readyProbe) Check() error {
+	return nil
+}
+
+type unreadyProbe struct{}
+
+func (u unreadyProbe) Check() error {
+	return errors.New("not ready")
 }

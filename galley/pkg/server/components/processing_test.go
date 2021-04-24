@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,186 +16,88 @@ package components
 
 import (
 	"fmt"
-	"net"
+	"io/ioutil"
 	"os"
+	"path"
 	"testing"
-	"time"
 
-	"github.com/google/go-cmp/cmp"
 	. "github.com/onsi/gomega"
-	"google.golang.org/grpc/metadata"
 
-	"istio.io/istio/galley/pkg/meshconfig"
-	"istio.io/istio/galley/pkg/runtime"
+	"istio.io/istio/galley/pkg/config/mesh"
+	"istio.io/istio/galley/pkg/config/processing"
+	"istio.io/istio/galley/pkg/config/processor"
+	"istio.io/istio/galley/pkg/config/source/kube"
 	"istio.io/istio/galley/pkg/server/settings"
-	"istio.io/istio/galley/pkg/source/kube/client"
-	"istio.io/istio/galley/pkg/source/kube/dynamic/converter"
-	"istio.io/istio/galley/pkg/source/kube/schema"
-	sourceSchema "istio.io/istio/galley/pkg/source/kube/schema"
-	"istio.io/istio/galley/pkg/testing/mock"
-	"istio.io/istio/pkg/mcp/monitoring"
-	mcptestmon "istio.io/istio/pkg/mcp/testing/monitoring"
+	"istio.io/istio/pkg/config/event"
+	kubelib "istio.io/istio/pkg/kube"
 )
 
 func TestProcessing_StartErrors(t *testing.T) {
-	g := NewGomegaWithT(t)
+	g := NewWithT(t)
 	defer resetPatchTable()
+
 loop:
 	for i := 0; ; i++ {
 		resetPatchTable()
-		mk := mock.NewKube()
-		newKubeFromConfigFile = func(string) (client.Interfaces, error) { return mk, nil }
-		newSource = func(client.Interfaces, time.Duration, *schema.Instance, *converter.Config) (runtime.Source, error) {
-			return runtime.NewInMemorySource(), nil
-		}
-		newMeshConfigCache = func(path string) (meshconfig.Cache, error) { return meshconfig.NewInMemory(), nil }
-		fsNew = func(string, *schema.Instance, *converter.Config) (runtime.Source, error) {
-			return runtime.NewInMemorySource(), nil
-		}
-		mcpMetricReporter = func(string) monitoring.Reporter {
-			return nil
-		}
-		verifyResourceTypesPresence = func(k client.Interfaces, specs []sourceSchema.ResourceSpec) ([]sourceSchema.ResourceSpec, error) {
-			return specs, nil
+		newInterfaces = func(string) (kube.Interfaces, error) {
+			return kube.NewInterfacesFromClient(kubelib.NewFakeClient()), nil
 		}
 
 		e := fmt.Errorf("err%d", i)
 
+		tmpDir, err := ioutil.TempDir(os.TempDir(), t.Name())
+		g.Expect(err).To(BeNil())
+
+		meshCfgDir := path.Join(tmpDir, "meshcfg")
+		err = os.Mkdir(meshCfgDir, os.ModePerm)
+		g.Expect(err).To(BeNil())
+
+		meshCfgFile := path.Join(tmpDir, "meshcfg.yaml")
+		_, err = os.Create(meshCfgFile)
+		g.Expect(err).To(BeNil())
+
 		args := settings.DefaultArgs()
-		args.APIAddress = "tcp://0.0.0.0:0"
-		args.Insecure = true
+		args.MeshConfigFile = meshCfgFile
 
 		switch i {
 		case 0:
-			newKubeFromConfigFile = func(string) (client.Interfaces, error) { return nil, e }
-		case 1:
-			newSource = func(client.Interfaces, time.Duration, *schema.Instance, *converter.Config) (runtime.Source, error) {
+			newInterfaces = func(string) (kube.Interfaces, error) {
 				return nil, e
 			}
+		case 1:
+			meshcfgNewFS = func(path string) (event.Source, error) { return nil, e }
 		case 2:
-			netListen = func(network, address string) (net.Listener, error) { return nil, e }
-		case 3:
-			newMeshConfigCache = func(path string) (meshconfig.Cache, error) { return nil, e }
-		case 4:
-			args.ConfigPath = "aaa"
-			fsNew = func(string, *schema.Instance, *converter.Config) (runtime.Source, error) { return nil, e }
-		case 5:
-			args.DisableResourceReadyCheck = true
-		case 6:
-			args.Insecure = false
-			args.AccessListFile = os.TempDir()
-		case 7:
-			args.Insecure = false
-			args.AccessListFile = "invalid file"
+			processorInitialize = func(processor.Settings) (*processing.Runtime, error) {
+				return nil, e
+			}
 		default:
 			break loop
+
 		}
 
 		p := NewProcessing(args)
-		err := p.Start()
+		err = p.Start()
 		g.Expect(err).NotTo(BeNil())
 		t.Logf("%d) err: %v", i, err)
 		p.Stop()
 	}
 }
 
-func TestServer_Basic(t *testing.T) {
-	g := NewGomegaWithT(t)
+func TestProcessing_Basic(t *testing.T) {
+	g := NewWithT(t)
 	resetPatchTable()
 	defer resetPatchTable()
 
-	mk := mock.NewKube()
-	newKubeFromConfigFile = func(string) (client.Interfaces, error) { return mk, nil }
-	newSource = func(client.Interfaces, time.Duration, *schema.Instance, *converter.Config) (runtime.Source, error) {
-		return runtime.NewInMemorySource(), nil
+	newInterfaces = func(string) (kube.Interfaces, error) {
+		return kube.NewInterfacesFromClient(kubelib.NewFakeClient()), nil
 	}
-	mcpMetricReporter = func(s string) monitoring.Reporter {
-		return mcptestmon.NewInMemoryStatsContext()
-	}
-	newMeshConfigCache = func(path string) (meshconfig.Cache, error) { return meshconfig.NewInMemory(), nil }
-	verifyResourceTypesPresence = func(_ client.Interfaces, specs []schema.ResourceSpec) ([]schema.ResourceSpec, error) {
-		return specs, nil
-	}
+	meshcfgNewFS = func(path string) (event.Source, error) { return mesh.NewInmemoryMeshCfg(), nil }
 
 	args := settings.DefaultArgs()
-	args.APIAddress = "tcp://0.0.0.0:0"
-	args.Insecure = true
 
 	p := NewProcessing(args)
 	err := p.Start()
 	g.Expect(err).To(BeNil())
 
-	g.Expect(p.Address()).NotTo(BeNil())
-
 	p.Stop()
-
-	g.Expect(p.Address()).To(BeNil())
-}
-
-func TestParseSinkMeta(t *testing.T) {
-	tests := []struct {
-		name    string
-		arg     []string
-		want    metadata.MD
-		wantErr bool
-	}{
-		{
-			name: "Simple",
-			arg:  []string{"foo=bar"},
-			want: metadata.MD{
-				"foo": []string{"bar"},
-			},
-		},
-		{
-			name: "MultipleValues",
-			arg:  []string{"foo=bar1", "foo=bar2"},
-			want: metadata.MD{
-				"foo": []string{"bar1", "bar2"},
-			},
-		},
-		{
-			name: "MultipleKeys",
-			arg:  []string{"foo1=bar", "foo2=bar"},
-			want: metadata.MD{
-				"foo1": []string{"bar"},
-				"foo2": []string{"bar"},
-			},
-		},
-		{
-			name:    "NoSeparator",
-			arg:     []string{"foo"},
-			wantErr: true,
-		},
-		{
-			name:    "NoValue",
-			arg:     []string{"foo="},
-			wantErr: true,
-		},
-		{
-			name:    "NoKey",
-			arg:     []string{"=foo"},
-			wantErr: true,
-		},
-		{
-			name:    "JustSeparator",
-			arg:     []string{"="},
-			wantErr: true,
-		},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			md := make(metadata.MD)
-			err := parseSinkMeta(test.arg, md)
-			if test.wantErr {
-				if err == nil {
-					t.Fatalf("Expected to fail but succeeded with: %v", md)
-				}
-				t.Logf("Failed as expected: %v", err)
-				return
-			}
-			if got := md; !cmp.Equal(got, test.want) {
-				t.Errorf("Wrong final metadata (-want, +got):\n%s", cmp.Diff(test.want, got))
-			}
-		})
-	}
 }

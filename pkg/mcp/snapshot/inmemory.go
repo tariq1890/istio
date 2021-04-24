@@ -1,4 +1,4 @@
-//  Copyright 2018 Istio Authors
+//  Copyright Istio Authors
 //
 //  Licensed under the Apache License, Version 2.0 (the "License");
 //  you may not use this file except in compliance with the License.
@@ -99,7 +99,6 @@ func (b *InMemoryBuilder) SetEntry(collection, name, version string, createTime 
 
 // DeleteEntry deletes the named entry within the given collection.
 func (b *InMemoryBuilder) DeleteEntry(collection string, name string) {
-
 	entries, found := b.snapshot.resources[collection]
 	if !found {
 		return
@@ -144,6 +143,15 @@ func (s *InMemory) Resources(collection string) []*mcp.Resource {
 // Version is an implementation of Snapshot.Version
 func (s *InMemory) Version(collection string) string {
 	return s.versions[collection]
+}
+
+// Collections is an implementation of Snapshot.Collections
+func (s *InMemory) Collections() []string {
+	result := make([]string, 0, len(s.resources))
+	for col := range s.resources {
+		result = append(result, col)
+	}
+	return result
 }
 
 // Clone this snapshot.

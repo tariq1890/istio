@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,88 +15,73 @@
 package kube
 
 import (
-	"errors"
+	"context"
 	"fmt"
 	"io"
-	"strings"
 	"time"
 
 	"github.com/hashicorp/go-multierror"
+	kubeCore "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	"istio.io/istio/pilot/pkg/model"
-	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/test"
 	appEcho "istio.io/istio/pkg/test/echo/client"
+	"istio.io/istio/pkg/test/framework/components/cluster"
 	"istio.io/istio/pkg/test/framework/components/echo"
 	"istio.io/istio/pkg/test/framework/components/echo/common"
-	kubeEnv "istio.io/istio/pkg/test/framework/components/environment/kube"
 	"istio.io/istio/pkg/test/framework/resource"
-
-	kubeCore "k8s.io/api/core/v1"
+	"istio.io/istio/pkg/test/util/retry"
 )
 
 const (
-	tcpHealthPort         = 3333
-	httpReadinessPort     = 8080
-	defaultDomain         = "cluster.local"
-	noSidecarWaitDuration = 10 * time.Second
+	tcpHealthPort     = 3333
+	httpReadinessPort = 8080
 )
 
 var (
 	_ echo.Instance = &instance{}
 	_ io.Closer     = &instance{}
+
+	startDelay = retry.Delay(2 * time.Second)
 )
 
 type instance struct {
-	id        resource.ID
-	cfg       echo.Config
-	clusterIP string
-	env       *kubeEnv.Environment
-	workloads []*workload
-	grpcPort  uint16
+	id          resource.ID
+	cfg         echo.Config
+	clusterIP   string
+	ctx         resource.Context
+	cluster     cluster.Cluster
+	workloadMgr *workloadManager
+	deployment  *deployment
 }
 
-func newInstance(ctx resource.Context, cfg echo.Config) (out *instance, err error) {
-	// Fill in defaults for any missing values.
-	common.AddPortIfMissing(&cfg, config.ProtocolGRPC)
-	if err = common.FillInDefaults(ctx, defaultDomain, &cfg); err != nil {
-		return nil, err
-	}
+func newInstance(ctx resource.Context, originalCfg echo.Config) (out *instance, err error) {
+	cfg := originalCfg.DeepCopy()
 
-	// Validate the configuration.
-	if cfg.Galley == nil {
-		// Galley is not actually required currently, but it will be once Pilot gets
-		// all resources from Galley. Requiring now for forward-compatibility.
-		return nil, errors.New("galley must be provided")
-	}
-
-	env := ctx.Environment().(*kubeEnv.Environment)
 	c := &instance{
-		env: env,
-		cfg: cfg,
+		cfg:     cfg,
+		ctx:     ctx,
+		cluster: cfg.Cluster,
 	}
-	c.id = ctx.TrackResource(c)
 
-	// Save the GRPC port.
-	grpcPort := common.GetPortForProtocol(&cfg, config.ProtocolGRPC)
-	if grpcPort == nil {
-		return nil, errors.New("unable fo find GRPC command port")
-	}
-	c.grpcPort = uint16(grpcPort.InstancePort)
-
-	// Generate the deployment YAML.
-	generatedYAML, err := generateYAML(cfg)
+	// Deploy echo to the cluster
+	c.deployment, err = newDeployment(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
 
-	// Deploy the YAML.
-	if err = env.ApplyContents(cfg.Namespace.Name(), generatedYAML); err != nil {
+	// Create the manager for echo workloads for this instance.
+	c.workloadMgr, err = newWorkloadManager(ctx, cfg, c.deployment)
+	if err != nil {
 		return nil, err
 	}
 
+	// Now that we have the successfully created the workload manager, track this resource so
+	// that it will be closed when it goes out of scope.
+	c.id = ctx.TrackResource(c)
+
 	// Now retrieve the service information to find the ClusterIP
-	s, err := env.GetService(cfg.Namespace.Name(), cfg.Service)
+	s, err := c.cluster.CoreV1().Services(cfg.Namespace.Name()).Get(context.TODO(), cfg.Service, metav1.GetOptions{})
 	if err != nil {
 		return nil, err
 	}
@@ -116,53 +101,6 @@ func newInstance(ctx resource.Context, cfg echo.Config) (out *instance, err erro
 	return c, nil
 }
 
-// getContainerPorts converts the ports to a port list of container ports.
-// Adds ports for health/readiness if necessary.
-func getContainerPorts(ports []echo.Port) model.PortList {
-	containerPorts := make(model.PortList, 0, len(ports))
-	var healthPort *model.Port
-	var readyPort *model.Port
-	for _, p := range ports {
-		// Add the port to the set of application ports.
-		cport := &model.Port{
-			Name:     p.Name,
-			Protocol: p.Protocol,
-			Port:     p.InstancePort,
-		}
-		containerPorts = append(containerPorts, cport)
-
-		switch p.Protocol {
-		case config.ProtocolGRPC:
-			continue
-		case config.ProtocolHTTP:
-			if p.InstancePort == httpReadinessPort {
-				readyPort = cport
-			}
-		default:
-			if p.InstancePort == tcpHealthPort {
-				healthPort = cport
-			}
-		}
-	}
-
-	// If we haven't added the readiness/health ports, do so now.
-	if readyPort == nil {
-		containerPorts = append(containerPorts, &model.Port{
-			Name:     "http-readiness-port",
-			Protocol: config.ProtocolHTTP,
-			Port:     httpReadinessPort,
-		})
-	}
-	if healthPort == nil {
-		containerPorts = append(containerPorts, &model.Port{
-			Name:     "tcp-health-port",
-			Protocol: config.ProtocolHTTP,
-			Port:     tcpHealthPort,
-		})
-	}
-	return containerPorts
-}
-
 func (c *instance) ID() resource.ID {
 	return c.id
 }
@@ -172,11 +110,7 @@ func (c *instance) Address() string {
 }
 
 func (c *instance) Workloads() ([]echo.Workload, error) {
-	out := make([]echo.Workload, 0, len(c.workloads))
-	for _, w := range c.workloads {
-		out = append(out, w)
-	}
-	return out, nil
+	return c.workloadMgr.ReadyWorkloads()
 }
 
 func (c *instance) WorkloadsOrFail(t test.Failer) []echo.Workload {
@@ -188,61 +122,21 @@ func (c *instance) WorkloadsOrFail(t test.Failer) []echo.Workload {
 	return out
 }
 
-func (c *instance) WaitUntilCallable(instances ...echo.Instance) error {
-	// Wait for the outbound config to be received by each workload from Pilot.
-	for _, w := range c.workloads {
-		if w.sidecar != nil {
-			if err := w.sidecar.WaitForConfig(common.OutboundConfigAcceptFunc(instances...)); err != nil {
-				return err
-			}
-		}
+func (c *instance) firstClient() (*appEcho.Instance, error) {
+	workloads, err := c.Workloads()
+	if err != nil {
+		return nil, err
 	}
-
-	if !c.cfg.Annotations.GetBool(echo.SidecarInject) {
-		time.Sleep(noSidecarWaitDuration)
-	}
-
-	return nil
+	return workloads[0].(*workload).Client()
 }
 
-func (c *instance) WaitUntilCallableOrFail(t test.Failer, instances ...echo.Instance) {
-	t.Helper()
-	if err := c.WaitUntilCallable(instances...); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func (c *instance) initialize(endpoints *kubeCore.Endpoints) error {
-	if c.workloads != nil {
-		// Already ready.
-		return nil
-	}
-
-	workloads := make([]*workload, 0)
-	for _, subset := range endpoints.Subsets {
-		for _, addr := range subset.Addresses {
-			workload, err := newWorkload(addr, c.cfg.Annotations, c.grpcPort, c.env.Accessor)
-			if err != nil {
-				return err
-			}
-			workloads = append(workloads, workload)
-		}
-	}
-
-	if len(workloads) == 0 {
-		return fmt.Errorf("no pods found for service %s/%s/%s", c.cfg.Namespace.Name(), c.cfg.Service, c.cfg.Version)
-	}
-
-	c.workloads = workloads
-	return nil
+// Start this echo instance
+func (c *instance) Start() error {
+	return c.workloadMgr.Start()
 }
 
 func (c *instance) Close() (err error) {
-	for _, w := range c.workloads {
-		err = multierror.Append(err, w.Close()).ErrorOrNil()
-	}
-	c.workloads = nil
-	return
+	return c.workloadMgr.Close()
 }
 
 func (c *instance) Config() echo.Config {
@@ -250,20 +144,7 @@ func (c *instance) Config() echo.Config {
 }
 
 func (c *instance) Call(opts echo.CallOptions) (appEcho.ParsedResponses, error) {
-	out, err := common.CallEcho(c.workloads[0].Instance, &opts, common.IdentityOutboundPortSelector)
-	if err != nil {
-		if opts.Port != nil {
-			err = fmt.Errorf("failed calling %s->'%s://%s:%d/%s': %v",
-				c.Config().Service,
-				strings.ToLower(string(opts.Port.Protocol)),
-				opts.Target.Config().Service,
-				opts.Port.ServicePort,
-				opts.Path,
-				err)
-		}
-		return nil, err
-	}
-	return out, nil
+	return c.aggregateResponses(opts, false)
 }
 
 func (c *instance) CallOrFail(t test.Failer, opts echo.CallOptions) appEcho.ParsedResponses {
@@ -273,4 +154,75 @@ func (c *instance) CallOrFail(t test.Failer, opts echo.CallOptions) appEcho.Pars
 		t.Fatal(err)
 	}
 	return r
+}
+
+func (c *instance) CallWithRetry(opts echo.CallOptions,
+	retryOptions ...retry.Option) (appEcho.ParsedResponses, error) {
+	return c.aggregateResponses(opts, true, retryOptions...)
+}
+
+func (c *instance) CallWithRetryOrFail(t test.Failer, opts echo.CallOptions,
+	retryOptions ...retry.Option) appEcho.ParsedResponses {
+	t.Helper()
+	r, err := c.CallWithRetry(opts, retryOptions...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r
+}
+
+func (c *instance) Restart() error {
+	// Wait for all current workloads to become ready and preserve the original count.
+	origWorkloads, err := c.workloadMgr.WaitForReadyWorkloads()
+	if err != nil {
+		return fmt.Errorf("restart failed to get initial workloads: %v", err)
+	}
+
+	// Restart the deployment.
+	if err := c.deployment.Restart(); err != nil {
+		return err
+	}
+
+	// Wait until all pods are ready and match the original count.
+	return retry.UntilSuccess(func() (err error) {
+		// Get the currently ready workloads.
+		workloads, err := c.workloadMgr.WaitForReadyWorkloads()
+		if err != nil {
+			return fmt.Errorf("failed waiting for restarted pods for echo %s/%s: %v",
+				c.cfg.Namespace.Name(), c.cfg.Service, err)
+		}
+
+		// Make sure the number of pods matches the original.
+		if len(workloads) != len(origWorkloads) {
+			return fmt.Errorf("failed restarting echo %s/%s: number of pods %d does not match original %d",
+				c.cfg.Namespace.Name(), c.cfg.Service, len(workloads), len(origWorkloads))
+		}
+
+		return nil
+	}, retry.Timeout(c.cfg.ReadinessTimeout), startDelay)
+}
+
+// aggregateResponses forwards an echo request from all workloads belonging to this echo instance and aggregates the results.
+func (c *instance) aggregateResponses(opts echo.CallOptions, retry bool, retryOptions ...retry.Option) (appEcho.ParsedResponses, error) {
+	resps := make([]*appEcho.ParsedResponse, 0)
+	workloads, err := c.Workloads()
+	if err != nil {
+		return nil, err
+	}
+	var aggErr error
+	for _, w := range workloads {
+		out, err := common.ForwardEcho(c.cfg.Service, w.(*workload).Client, &opts, retry, retryOptions...)
+		if err != nil {
+			aggErr = multierror.Append(err, aggErr)
+			continue
+		}
+		for _, r := range out {
+			resps = append(resps, r)
+		}
+	}
+	if aggErr != nil {
+		return nil, aggErr
+	}
+
+	return resps, nil
 }

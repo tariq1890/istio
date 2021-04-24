@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,38 +18,41 @@ import (
 	"fmt"
 	"strings"
 	"testing"
-
-	"istio.io/istio/pilot/test/util"
 )
 
 func TestProxyStatus(t *testing.T) {
-	cannedConfig := map[string][]byte{
-		"details-v1-5b7f94f9bc-wp5tb": util.ReadFile("../pkg/writer/compare/testdata/envoyconfigdump.json", t),
-	}
 	cases := []execTestCase{
 		{ // case 0
 			args:           strings.Split("proxy-status", " "),
-			expectedString: "NAME     CDS     LDS     EDS     RDS     PILOT",
+			expectedString: "NAME     CDS     LDS     EDS     RDS     ISTIOD",
 		},
 		{ // case 1 short name "ps"
 			args:           strings.Split("ps", " "),
-			expectedString: "NAME     CDS     LDS     EDS     RDS     PILOT",
+			expectedString: "NAME     CDS     LDS     EDS     RDS     ISTIOD",
 		},
-		{ // case 2  "proxy-status podName.namespace"
-			execClientConfig: cannedConfig,
-			args:             strings.Split("proxy-status details-v1-5b7f94f9bc-wp5tb.default", " "),
-			expectedOutput: `Clusters Match
-Listeners Match
-Routes Match
-`,
+		{ // case 2: supplying nonexistent pod name should result in error with flag
+			args:          strings.Split("proxy-status deployment/random-gibberish", " "),
+			wantException: true,
 		},
-		{ // case 3  "proxy-status podName -n namespace"
-			execClientConfig: cannedConfig,
-			args:             strings.Split("proxy-status details-v1-5b7f94f9bc-wp5tb -n default", " "),
-			expectedOutput: `Clusters Match
-Listeners Match
-Routes Match
-`,
+		{ // case 3: supplying nonexistent deployment name
+			args:          strings.Split("proxy-status deployment/random-gibberish.default", " "),
+			wantException: true,
+		},
+		{ // case 4: supplying nonexistent deployment name in nonexistent namespace
+			args:          strings.Split("proxy-status deployment/random-gibberish.bogus", " "),
+			wantException: true,
+		},
+		{ // case 5: supplying nonexistent pod name should result in error
+			args:          strings.Split("proxy-status random-gibberish-podname-61789237418234", " "),
+			wantException: true,
+		},
+		{ // case 6: new --revision argument
+			args:           strings.Split("proxy-status --revision canary", " "),
+			expectedString: "NAME     CDS     LDS     EDS     RDS     ISTIOD",
+		},
+		{ // case 7: supplying type that doesn't select pods should fail
+			args:          strings.Split("proxy-status serviceaccount/sleep", " "),
+			wantException: true,
 		},
 	}
 

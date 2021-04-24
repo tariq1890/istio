@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,14 +20,17 @@ import (
 	"io/ioutil"
 	"os"
 	"path"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"istio.io/istio/pkg/test"
-	"istio.io/istio/pkg/test/framework/components/environment"
-	"istio.io/istio/pkg/test/framework/core"
+	"istio.io/istio/pkg/test/framework/components/cluster"
+	"istio.io/istio/pkg/test/framework/errors"
 	"istio.io/istio/pkg/test/framework/label"
 	"istio.io/istio/pkg/test/framework/resource"
 	"istio.io/istio/pkg/test/scopes"
+	"istio.io/istio/pkg/test/util/yml"
 )
 
 // TestContext is a test-level context that can be created as part of test executing tests.
@@ -40,7 +43,8 @@ type TestContext interface {
 	// create their own Golang *testing.T with the name provided.
 	//
 	// If this TestContext was not created by a Test or if that Test is not running, this method will panic.
-	NewSubTest(name string) *Test
+	NewSubTest(name string) Test
+	NewSubTestf(format string, a ...interface{}) Test
 
 	// WorkDir allocated for this test.
 	WorkDir() string
@@ -50,12 +54,6 @@ type TestContext interface {
 
 	// CreateTmpDirectoryOrFail creates a new temporary directory with the given prefix in the workdir, or fails the test.
 	CreateTmpDirectoryOrFail(prefix string) string
-
-	// RequireOrSkip skips the test if the environment is not as expected.
-	RequireOrSkip(envName environment.Name)
-
-	// WhenDone runs the given function when the test context completes.
-	WhenDone(fn func() error)
 
 	// Done should be called when this context is no longer needed. It triggers the asynchronous cleanup of any
 	// allocated resources.
@@ -74,16 +72,20 @@ type TestContext interface {
 	Skipped() bool
 }
 
-var _ TestContext = &testContext{}
-var _ test.Failer = &testContext{}
+var (
+	_ TestContext = &testContext{}
+	_ test.Failer = &testContext{}
+)
 
 // testContext for the currently executing test.
 type testContext struct {
+	yml.FileWriter
+
 	// The id of the test context. useful for debugging the test framework itself.
 	id string
 
 	// The currently running Test. Non-nil if this context was created by a Test
-	test *Test
+	test *testImpl
 
 	// The underlying Go testing.T for this context.
 	*testing.T
@@ -98,7 +100,48 @@ type testContext struct {
 	workDir string
 }
 
-func newTestContext(test *Test, goTest *testing.T, s *suiteContext, parentScope *scope, labels label.Set) *testContext {
+// Before executing a new context, we should wait for existing contexts to terminate if they are NOT parents of this context.
+// This is to workaround termination of functions run with RunParallel. When this is used, child tests will not run until the parent
+// has terminated. This means that the parent cannot synchronously cleanup, or it would block its children. However, if we do async cleanup,
+// then new tests can unexpectedly start during the cleanup of another. This may lead to odd results, like a test cleanup undoing the setup of a future test.
+// To workaround this, we maintain a set of all contexts currently terminating. Before starting the context, we will search this set;
+// if any non-parent contexts are found, we will wait.
+func waitForParents(test *testImpl) {
+	iterations := 0
+	for {
+		iterations++
+		done := true
+		globalParentLock.Range(func(key, value interface{}) bool {
+			k := key.(*testImpl)
+			current := test
+			for current != nil {
+				if current == k {
+					return true
+				}
+				current = current.parent
+
+			}
+			// We found an item in the list, and we are *not* a child of it. This means another test hierarchy has exclusive access right now
+			// Wait until they are finished before proceeding
+			done = false
+			return true
+		})
+		if done {
+			return
+		}
+		time.Sleep(time.Millisecond * 50)
+		// Add some logging in case something locks up so we can debug
+		if iterations%10 == 0 {
+			globalParentLock.Range(func(key, value interface{}) bool {
+				scopes.Framework.Warnf("Stuck waiting for parent test suites to terminate... %v is blocking", key.(*testImpl).goTest.Name())
+				return true
+			})
+		}
+	}
+}
+
+func newTestContext(test *testImpl, goTest *testing.T, s *suiteContext, parentScope *scope, labels label.Set) *testContext {
+	waitForParents(test)
 	id := s.allocateContextID(goTest.Name())
 
 	allLabels := s.suiteLabels.Merge(labels)
@@ -106,8 +149,12 @@ func newTestContext(test *Test, goTest *testing.T, s *suiteContext, parentScope 
 		goTest.Skipf("Skipping: label mismatch: labels=%v, filter=%v", allLabels, s.settings.Selector)
 	}
 
+	if s.settings.SkipMatcher.MatchTest(goTest.Name()) {
+		goTest.Skipf("Skipping: test %v matched -istio.test.skip regex", goTest.Name())
+	}
+
 	scopes.Framework.Debugf("Creating New test context")
-	workDir := path.Join(s.settings.RunDir(), goTest.Name())
+	workDir := path.Join(s.settings.RunDir(), goTest.Name(), "_test_context")
 	if err := os.MkdirAll(workDir, os.ModePerm); err != nil {
 		goTest.Fatalf("Error creating work dir %q: %v", workDir, err)
 	}
@@ -120,16 +167,17 @@ func newTestContext(test *Test, goTest *testing.T, s *suiteContext, parentScope 
 
 	scopeID := fmt.Sprintf("[%s]", id)
 	return &testContext{
-		id:      id,
-		test:    test,
-		T:       goTest,
-		suite:   s,
-		scope:   newScope(scopeID, parentScope),
-		workDir: workDir,
+		id:         id,
+		test:       test,
+		T:          goTest,
+		suite:      s,
+		scope:      newScope(scopeID, parentScope),
+		workDir:    workDir,
+		FileWriter: yml.NewFileWriter(workDir),
 	}
 }
 
-func (c *testContext) Settings() *core.Settings {
+func (c *testContext) Settings() *resource.Settings {
 	return c.suite.settings
 }
 
@@ -140,6 +188,10 @@ func (c *testContext) TrackResource(r resource.Resource) resource.ID {
 	return rid
 }
 
+func (c *testContext) GetResource(ref interface{}) error {
+	return c.scope.get(ref)
+}
+
 func (c *testContext) WorkDir() string {
 	return c.workDir
 }
@@ -148,13 +200,21 @@ func (c *testContext) Environment() resource.Environment {
 	return c.suite.environment
 }
 
+func (c *testContext) Clusters() cluster.Clusters {
+	if c == nil || c.Environment() == nil {
+		return nil
+	}
+	return c.Environment().Clusters()
+}
+
 func (c *testContext) CreateDirectory(name string) (string, error) {
-	dir, err := ioutil.TempDir(c.workDir, name)
+	dir := filepath.Join(c.workDir, name)
+	err := os.Mkdir(dir, os.ModePerm)
 	if err != nil {
-		scopes.Framework.Errorf("Error creating temp dir: runID='%v', prefix='%s', workDir='%v', err='%v'",
+		scopes.Framework.Errorf("Error creating dir: runID='%v', prefix='%s', workDir='%v', err='%v'",
 			c.suite.settings.RunID, name, c.workDir, err)
 	} else {
-		scopes.Framework.Debugf("Created a temp dir: runID='%v', name='%s'", c.suite.settings.RunID, dir)
+		scopes.Framework.Debugf("Created a dir: runID='%v', name='%s'", c.suite.settings.RunID, dir)
 	}
 	return dir, err
 }
@@ -179,6 +239,10 @@ func (c *testContext) CreateTmpDirectory(prefix string) (string, error) {
 	return dir, err
 }
 
+func (c *testContext) Config(clusters ...cluster.Cluster) resource.ConfigManager {
+	return newConfigManager(c, clusters)
+}
+
 func (c *testContext) CreateTmpDirectoryOrFail(prefix string) string {
 	tmp, err := c.CreateTmpDirectory(prefix)
 	if err != nil {
@@ -187,17 +251,11 @@ func (c *testContext) CreateTmpDirectoryOrFail(prefix string) string {
 	return tmp
 }
 
-func (c *testContext) RequireOrSkip(envName environment.Name) {
-	if c.Environment().EnvironmentName() != envName {
-		c.Skipf("Skipping %q: expected environment not found: %s", c.Name(), envName)
-	}
-}
-
-func (c *testContext) newChildContext(test *Test) *testContext {
+func (c *testContext) newChildContext(test *testImpl) *testContext {
 	return newTestContext(test, test.goTest, c.suite, c.scope, label.NewSet(test.labels...))
 }
 
-func (c *testContext) NewSubTest(name string) *Test {
+func (c *testContext) NewSubTest(name string) Test {
 	if c.test == nil {
 		panic(fmt.Sprintf("Attempting to create subtest %s from a TestContext with no associated Test", name))
 	}
@@ -206,27 +264,47 @@ func (c *testContext) NewSubTest(name string) *Test {
 		panic(fmt.Sprintf("Attempting to create subtest %s before running parent", name))
 	}
 
-	return &Test{
-		name:   name,
-		parent: c.test,
-		s:      c.test.s,
+	return &testImpl{
+		name:          name,
+		parent:        c.test,
+		s:             c.test.s,
+		featureLabels: c.test.featureLabels,
 	}
 }
 
-func (c *testContext) WhenDone(fn func() error) {
-	c.scope.addCloser(&closer{fn})
+func (c *testContext) NewSubTestf(format string, a ...interface{}) Test {
+	return c.NewSubTest(fmt.Sprintf(format, a...))
+}
+
+func (c *testContext) ConditionalCleanup(fn func()) {
+	c.scope.addCloser(&closer{fn: func() error {
+		fn()
+		return nil
+	}, noskip: true})
+}
+
+func (c *testContext) Cleanup(fn func()) {
+	c.scope.addCloser(&closer{fn: func() error {
+		fn()
+		return nil
+	}})
 }
 
 func (c *testContext) Done() {
-	if c.Failed() {
+	if c.Failed() && c.Settings().CIMode {
 		scopes.Framework.Debugf("Begin dumping testContext: %q", c.id)
-		c.scope.dump()
+		rt.Dump(c)
 		scopes.Framework.Debugf("Completed dumping testContext: %q", c.id)
 	}
 
 	scopes.Framework.Debugf("Begin cleaning up testContext: %q", c.id)
 	if err := c.scope.done(c.suite.settings.NoCleanup); err != nil {
 		c.Logf("error scope cleanup: %v", err)
+		if c.Settings().FailOnDeprecation {
+			if errors.IsOrContainsDeprecatedError(err) {
+				c.Error("Using deprecated Envoy features. Failing due to -istio.test.deprecation_failure flag.")
+			}
+		}
 	}
 	scopes.Framework.Debugf("Completed cleaning up testContext: %q", c.id)
 }
@@ -304,7 +382,8 @@ func (c *testContext) Skipped() bool {
 var _ io.Closer = &closer{}
 
 type closer struct {
-	fn func() error
+	fn     func() error
+	noskip bool
 }
 
 func (c *closer) Close() error {

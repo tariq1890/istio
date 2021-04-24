@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,7 +21,7 @@ import (
 )
 
 func TestStr2NamedPort(t *testing.T) {
-	var tests = []struct {
+	tests := []struct {
 		input  string    // input
 		expVal NamedPort // output
 		expErr bool      // error
@@ -53,7 +53,7 @@ func TestStr2NamedPort(t *testing.T) {
 }
 
 func TestSplitEqual(t *testing.T) {
-	var tests = []struct {
+	tests := []struct {
 		input string // input
 		expK  string // output1
 		expV  string // output2
@@ -74,7 +74,7 @@ func TestSplitEqual(t *testing.T) {
 }
 
 func TestSamePorts(t *testing.T) {
-	var tests = []struct {
+	tests := []struct {
 		input1   []v1.EndpointPort
 		input2   map[int32]bool
 		expected bool // result
